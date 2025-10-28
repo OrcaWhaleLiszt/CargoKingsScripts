@@ -1,15 +1,13 @@
---[[ 
+--[[
 OrcaCreations UnifiedPlanePhysics v4.2
 (Realistic Takeoff + Recovery Assist + Terminal Fall Clamp)
 
 Author: GPT-5 Thinking (ChatGPT)
 Placement: ServerScriptService (centralized for all planes)
 
-Delta vs v4.1 (tiny change):
-- Add a terminal downward speed cap so dives don’t exceed a sensible limit.
-- New optional config key: PlaneConfig.TERMINAL_FALL_SPEED (defaults to 160).
-- Clamp applied to both the commanded BodyVelocity (Y) and final AssemblyLinearVelocity (Y) while airborne.
-- Welding/seat/cargo logic UNTOUCHED.
+Combined with v4.4 Refuel Module (by Gemini)
+- Physics are 100% v4.2 (assisted fall)
+- Refuel logic is from v4.4 (standalone)
 ]]--
 
 local Players = game:GetService("Players")
@@ -46,6 +44,17 @@ end)
 local PROMPT_NAMES = { "PlaneProximityPrompt", "PlaneProximtyPrompt", "ProximityPrompt" }
 local PROMPT_RADIUS = 18
 local PROMPT_DEFAULT_HOLD = 1.0 -- default if PlaneConfig omits
+
+-- =======================
+-- [REFUEL ADDITION]
+-- =======================
+local REFUEL_RADIUS_STUDS      = 250        -- how close to refuel
+local REFUEL_RATE_PER_SEC      = 0.02       -- +2% per second → adds dt*rate
+local REFUEL_CHECK_INTERVAL    = 1.0        -- don’t scan too often
+local REFUEL_TAG               = "RefuelStation" -- optional; uses tag if found, else name check
+-- =======================
+-- [END REFUEL ADDITION]
+-- =======================
 
 -- Cargo Kings seat/cargo config
 local DEFAULT_MAX_CARGO_KILOS = 50
@@ -150,6 +159,8 @@ type PD = {
 	seat: Seat?,
 	landingGear: Instance?,
 
+	gearParts: {BasePart}, -- Added from v4.4 init logic
+
 	move: BodyVelocity,
 	gyro: BodyGyro,
 
@@ -184,8 +195,12 @@ type PD = {
 
 	player: Player?,
 
-	-- v4.1+
+	-- v4.2
 	fallAssist: number,
+
+	-- [REFUEL ADDITION]
+	lastRefuelCheck: number,
+	currentRefuelStation: BasePart?,
 }
 
 local registry: {[Model]: PD} = {}
@@ -223,8 +238,8 @@ local function setupGearParts(landingGearInstance)
 			if v:IsA("BasePart") then
 				if not v:FindFirstChild("Trans") then
 					local t = Instance.new("NumberValue", v); t.Name="Trans"; t.Value=v.Transparency
-					local r = Instance.new("NumberValue", v); r.Name="Ref";   r.Value=v.Reflectance
-					local c = Instance.new("BoolValue",  v); c.Name="Collide"; c.Value=v.CanCollide
+					local r = Instance.new("NumberValue", v); r.Name="Ref"; r.Value=v.Reflectance
+					local c = Instance.new("BoolValue", v); c.Name="Collide"; c.Value=v.CanCollide
 				end
 				table.insert(gearParts, v)
 			end
@@ -320,11 +335,15 @@ local function initPlane(model: Model): PD?
 		isBraking = false, landingTime = 0, hasBeenAirborne = false,
 
 		engineSound = mkSound("EngineSound", cfg.ENGINE_SOUND_ID, cfg.ENGINE_MIN_VOLUME, cfg.ENGINE_MIN_PITCH, cfg.ENGINE_SOUND_ROLLOFF),
-		windSound   = mkSound("WindSound",   cfg.WIND_SOUND_ID,   0,                   cfg.WIND_MIN_PITCH,   cfg.WIND_SOUND_ROLLOFF),
+		windSound = mkSound("WindSound", cfg.WIND_SOUND_ID, 0, cfg.WIND_MIN_PITCH, cfg.WIND_SOUND_ROLLOFF),
 
 		player = nil,
 
 		fallAssist = 0,
+
+		-- [REFUEL ADDITION]
+		lastRefuelCheck = 0,
+		currentRefuelStation = nil,
 	}
 
 	-- Disable vanilla sitting; we will briefly enable when boarding
@@ -385,7 +404,7 @@ local function activate(pd: PD, plr: Player)
 	setForceCaps(pd, true)
 
 	if pd.engineSound then pd.engineSound:Play() end
-	if pd.windSound   then pd.windSound:Play()   end
+	if pd.windSound then pd.windSound:Play() end
 	if RE_Activate then pcall(function() RE_Activate:FireClient(plr, pd.plane, true) end) end
 end
 
@@ -407,12 +426,90 @@ local function deactivate(pd: PD)
 	pcall(function() pd.main:SetNetworkOwnershipAuto() end)
 
 	if pd.engineSound then pd.engineSound:Stop() end
-	if pd.windSound   then pd.windSound:Stop() end
+	if pd.windSound then pd.windSound:Stop() end
 	if RE_Activate and pd.player then pcall(function() RE_Activate:FireClient(pd.player, pd.plane, false) end) end
 	pd.on = false
 	pd.player = nil
 	pd.plane:SetAttribute("CurrentThrottle", 0)
 end
+
+-- =======================
+-- [REFUEL ADDITION - HELPER FUNCTIONS]
+-- =======================
+local function iterRefuelStations()
+	-- Prefer CollectionService tag; fallback to scanning by name
+	local stations = {}
+	local ok, err = pcall(function()
+		local CS = game:GetService("CollectionService")
+		for _, inst in ipairs(CS:GetTagged(REFUEL_TAG)) do
+			if inst:IsA("BasePart") then table.insert(stations, inst) end
+		end
+	end)
+	if ok and #stations > 0 then
+		return stations
+	end
+
+	-- Fallback: name-based search (any BasePart named "RefuelStation")
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("BasePart") and obj.Name == REFUEL_TAG then
+			table.insert(stations, obj)
+		end
+	end
+	return stations
+end
+
+local function findNearestRefuelStation(fromPos, maxDist)
+	local nearest, best = nil, maxDist or REFUEL_RADIUS_STUDS
+	for _, part in ipairs(iterRefuelStations()) do
+		local d = (part.Position - fromPos).Magnitude
+		if d < best then
+			nearest, best = part, d
+		end
+	end
+	return nearest, best
+end
+
+-- pd fields expected:
+-- pd.plane            : Model
+-- pd.main             : BasePart
+-- pd.lastRefuelCheck  : number (tick)
+-- pd.currentRefuelStation : BasePart|nil
+local function stepRefuel(pd: PD, now: number)
+	if not pd or not pd.main or not pd.plane then return end
+	
+	-- Initialize lastRefuelCheck if it's 0
+	if pd.lastRefuelCheck == 0 then
+		pd.lastRefuelCheck = now
+	end
+
+	-- Respect check interval
+	if (now - pd.lastRefuelCheck) < REFUEL_CHECK_INTERVAL then return end
+	local dt = (now - pd.lastRefuelCheck)
+	pd.lastRefuelCheck = now
+
+	-- Look for the closest eligible station
+	local station, dist = findNearestRefuelStation(pd.main.Position, REFUEL_RADIUS_STUDS)
+	if not station then
+		pd.currentRefuelStation = nil
+		return
+	end
+
+	-- Within radius → add fuel proportional to dt
+	local currentFuel = pd.plane:GetAttribute("FuelRange") or 0
+	if currentFuel >= 1 then
+		pd.currentRefuelStation = station
+		return
+	end
+
+	local add = REFUEL_RATE_PER_SEC * dt
+	local newFuel = math.clamp(currentFuel + add, 0, 1)
+	pd.plane:SetAttribute("FuelRange", newFuel)
+	
+	pd.currentRefuelStation = station
+end
+-- =======================
+-- [END REFUEL ADDITION]
+-- =======================
 
 -- =======================
 -- [CARGO KINGS - UNTOUCHED]
@@ -537,15 +634,16 @@ local function update(pd: PD, input)
 	if pd.engineSound then
 		local t = pd.throttle
 		pd.engineSound.Volume = cfg.ENGINE_MIN_VOLUME + (cfg.ENGINE_MAX_VOLUME - cfg.ENGINE_MIN_VOLUME) * t
-		pd.engineSound.Pitch  = cfg.ENGINE_MIN_PITCH  + (cfg.ENGINE_MAX_PITCH  - cfg.ENGINE_MIN_PITCH ) * t
+		pd.engineSound.Pitch = cfg.ENGINE_MIN_PITCH + (cfg.ENGINE_MAX_PITCH - cfg.ENGINE_MIN_PITCH ) * t
 	end
 	if pd.windSound then
 		local sPct = math.clamp((pd.realSpeed - cfg.WIND_START_SPEED) / (pd.maxSpeed - cfg.WIND_START_SPEED), 0, 1)
 		pd.windSound.Volume = cfg.WIND_MIN_VOLUME + (cfg.WIND_MAX_VOLUME - cfg.WIND_MIN_VOLUME) * sPct
-		pd.windSound.Pitch  = cfg.WIND_MIN_PITCH  + (cfg.WIND_MAX_PITCH  - cfg.WIND_MIN_PITCH ) * sPct
+		pd.windSound.Pitch = cfg.WIND_MIN_PITCH + (cfg.WIND_MAX_PITCH - cfg.WIND_MIN_PITCH ) * sPct
 	end
 
 	if RE_Throttle and pd.player then
+		-- [REFUEL ADDITION] Pass fuelRange
 		pcall(function() RE_Throttle:FireClient(pd.player, pd.throttle, pd.brakeThrottle, pd.fuelRange) end)
 	end
 	pd.plane:SetAttribute("CurrentThrottle", pd.throttle)
@@ -559,8 +657,8 @@ local function update(pd: PD, input)
 			local c = v:FindFirstChild("Collide")
 			if t and r and c then
 				v.Transparency = (pd.gear and t.Value or 1)
-				v.Reflectance  = (pd.gear and r.Value or 0)
-				v.CanCollide   = (pd.gear and c.Value or false)
+				v.Reflectance = (pd.gear and r.Value or 0)
+				v.CanCollide = (pd.gear and c.Value or false)
 			end
 		end
 	end
@@ -572,7 +670,7 @@ local function update(pd: PD, input)
 	local vary = -pd.main.CFrame.LookVector.Y * (pd.speedVary or 0)
 	local vmax = math.max(1, (pd.maxSpeed or 200) + vary)
 	local forward = vmax * pd.throttle
-	local brake   = vmax * pd.brakeThrottle * cfg.BRAKE_FORCE_MULTIPLIER
+	local brake = vmax * pd.brakeThrottle * cfg.BRAKE_FORCE_MULTIPLIER
 	pd.desiredSpeed = forward + brake
 
 	local change = (pd.desiredSpeed > pd.currentSpeed) and 1 or -1
@@ -631,7 +729,7 @@ local function update(pd: PD, input)
 	local flightCFrame = input.mouseHit * CFrame.Angles(0, 0, math.rad(bank))
 	local targetCFrame = groundCFrame:Lerp(flightCFrame, transitionFactor)
 
-	-- ===== v4.1 RECOVERY ASSIST =====
+	-- ===== v4.2 RECOVERY ASSIST =====
 	local targetLookY = targetCFrame.LookVector.Y
 	local noseUpIntent = math.clamp((-targetLookY - 0.02) / 0.6, 0, 1)
 	local throttleIntent = math.clamp((pd.throttle - 0.5) / 0.5, 0, 1)
@@ -664,11 +762,11 @@ local function update(pd: PD, input)
 	-- Gyro torque setup with sensitivities
 	local F = cfg.MAX_SAFE_FORCE
 	local pitchSensitivity = cfg.PITCH_SENSITIVITY or 1.0
-	local bankSensitivity  = cfg.BANK_SENSITIVITY  or 1.0
+	local bankSensitivity = cfg.BANK_SENSITIVITY or 1.0
 	local targetPitchTorque = F * transitionFactor * pitchSensitivity
-	local targetBankTorque  = F * bankSensitivity
+	local targetBankTorque = F * bankSensitivity
 
-	-- ===== v4.2: terminal fall speed (very small addition) =====
+	-- ===== v4.2: terminal fall speed =====
 	local TERMINAL_FALL_SPEED = cfg.TERMINAL_FALL_SPEED or 160
 	-- ==========================================================
 
@@ -760,7 +858,7 @@ local function bindPrompt(pd: PD)
 	prompt.ActionText = (pd.cfg and pd.cfg.PROMPT_TEXT) or "Pilot Plane"
 	prompt.HoldDuration = hold
 	prompt.KeyboardKeyCode = Enum.KeyCode.E
-	prompt.GamepadKeyCode  = Enum.KeyCode.ButtonX
+	prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
 	prompt.MaxActivationDistance = PROMPT_RADIUS
 	prompt.RequiresLineOfSight = false
 	prompt.Enabled = true
@@ -826,4 +924,22 @@ Workspace.DescendantAdded:Connect(function(d)
 	task.defer(registerIfPlane, d)
 end)
 
-print("✅ UnifiedPlanePhysics v4.2 loaded (Realistic Takeoff + Recovery Assist + Terminal Fall Clamp)")
+-- =======================
+-- [REFUEL ADDITION - PASSIVE LOOP]
+-- =======================
+-- This loop runs passively to check for refueling,
+-- separate from the physics 'update' loop.
+RunService.Heartbeat:Connect(function()
+	local now = tick()
+	for _, pd in pairs(registry) do
+		-- Check if plane exists and is in the workspace
+		if pd.plane and pd.plane.Parent then
+			stepRefuel(pd, now)
+		end
+	end
+end)
+-- =======================
+-- [END REFUEL ADDITION]
+-- =======================
+
+print("✅ UnifiedPlanePhysics v4.2 loaded (Realistic Takeoff + Recovery Assist + Refuel Module)")
