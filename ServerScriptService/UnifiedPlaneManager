@@ -1,17 +1,15 @@
---[[ OrcaCreations UnifiedPlanePhysics v4.4 (Natural Gravity Fix)
- - Script by Gemini (Google)
- - Centralized script for ServerScriptService.
- 
-Changes in v4.4:
-- [Gravity Fix] Removed the 'fallSpeed' variable entirely.
-- The 'BodyVelocity' is now only responsible for 'baseVelocity' (thrust).
-- The 'yAxisForce' (lift) now directly counteracts Roblox's gravity.
-- This creates a natural fall and recovery, tuneable with LIFT_MULTIPLIER.
-- All other logic (stall, takeoff, bank scaling, welding) is unchanged.
+--[[ 
+OrcaCreations UnifiedPlanePhysics v4.2
+(Realistic Takeoff + Recovery Assist + Terminal Fall Clamp)
 
-Changes in v4.4+ (Refuel):
-- [REFUEL ADDITION] Added standalone refueling module.
-- No changes to any physics or welding code.
+Author: GPT-5 Thinking (ChatGPT)
+Placement: ServerScriptService (centralized for all planes)
+
+Delta vs v4.1 (tiny change):
+- Add a terminal downward speed cap so dives don’t exceed a sensible limit.
+- New optional config key: PlaneConfig.TERMINAL_FALL_SPEED (defaults to 160).
+- Clamp applied to both the commanded BodyVelocity (Y) and final AssemblyLinearVelocity (Y) while airborne.
+- Welding/seat/cargo logic UNTOUCHED.
 ]]--
 
 local Players = game:GetService("Players")
@@ -47,22 +45,9 @@ end)
 -- ======= Local tuning (non-physics) =======
 local PROMPT_NAMES = { "PlaneProximityPrompt", "PlaneProximtyPrompt", "ProximityPrompt" }
 local PROMPT_RADIUS = 18
-local PROMPT_DEFAULT_HOLD = 1.0 -- ≤— default if PlaneConfig omits
+local PROMPT_DEFAULT_HOLD = 1.0 -- default if PlaneConfig omits
 
--- =======================
--- [REFUEL ADDITION]
--- =======================
-local REFUEL_RADIUS_STUDS      = 250        -- how close to refuel
-local REFUEL_RATE_PER_SEC      = 0.02       -- +2% per second → adds dt*rate
-local REFUEL_CHECK_INTERVAL    = 1.0        -- don’t scan too often
-local REFUEL_TAG               = "RefuelStation" -- optional; uses tag if found, else name check
--- =======================
--- [END REFUEL ADDITION]
--- =======================
-
--- =======================
 -- Cargo Kings seat/cargo config
--- =======================
 local DEFAULT_MAX_CARGO_KILOS = 50
 local PROMPT_DISTANCE = 10
 
@@ -123,7 +108,6 @@ local function centralWeldOnce(plane: Model, main: BasePart)
 	-- Clear existing weld-like things
 	for _, bp in ipairs(toWeld) do
 		for _, c in ipairs(bp:GetChildren()) do
-			-- [FIX] Corrected typo "WDeld" to "Weld"
 			if c:IsA("Weld") or c:IsA("Snap") or c:IsA("WeldConstraint") then
 				c:Destroy()
 			end
@@ -165,8 +149,6 @@ type PD = {
 	main: BasePart,
 	seat: Seat?,
 	landingGear: Instance?,
-	
-	gearParts: {BasePart}, -- [FIX] Added missing type
 
 	move: BodyVelocity,
 	gyro: BodyGyro,
@@ -179,7 +161,7 @@ type PD = {
 
 	desiredSpeed: number,
 	currentSpeed: number,
-	realSpeed: number, -- Total velocity magnitude (for sound)
+	realSpeed: number,
 
 	throttle: number,
 	brakeThrottle: number,
@@ -202,18 +184,17 @@ type PD = {
 
 	player: Player?,
 
-	-- [REFUEL ADDITION]
-	lastRefuelCheck: number,
-	currentRefuelStation: BasePart?,
+	-- v4.1+
+	fallAssist: number,
 }
 
 local registry: {[Model]: PD} = {}
 
--- Re-uses existing movers, does not destroy
+-- Re-uses existing movers, does not destroy valid ones
 local function findOrCreateBodyMovers(main: BasePart): (BodyVelocity, BodyGyro)
 	local move = main:FindFirstChild("Move")
 	if not (move and move:IsA("BodyVelocity")) then
-		if move then move:Destroy() end -- Destroy only if it's the wrong type
+		if move then move:Destroy() end
 		move = Instance.new("BodyVelocity")
 		move.Name = "Move"
 		move.Velocity = Vector3.zero
@@ -223,7 +204,7 @@ local function findOrCreateBodyMovers(main: BasePart): (BodyVelocity, BodyGyro)
 
 	local gyro = main:FindFirstChild("Gyro")
 	if not (gyro and gyro:IsA("BodyGyro")) then
-		if gyro then gyro:Destroy() end -- Destroy only if it's the wrong type
+		if gyro then gyro:Destroy() end
 		gyro = Instance.new("BodyGyro")
 		gyro.Name = "Gyro"
 		gyro.MaxTorque = Vector3.zero
@@ -234,18 +215,16 @@ local function findOrCreateBodyMovers(main: BasePart): (BodyVelocity, BodyGyro)
 	return move, gyro
 end
 
--- [V4.0] Landing gear setup (from modular script)
+-- Setup gear parts tags
 local function setupGearParts(landingGearInstance)
 	local gearParts = {}
 	local function getGear(p)
 		for _,v in ipairs(p:GetChildren()) do
 			if v:IsA("BasePart") then
-				-- Only add if tags don't exist
 				if not v:FindFirstChild("Trans") then
 					local t = Instance.new("NumberValue", v); t.Name="Trans"; t.Value=v.Transparency
-					-- [FIX] Removed invalid non-breaking space characters
-					local r = Instance.new("NumberValue", v); r.Name="Ref"; r.Value=v.Reflectance
-					local c = Instance.new("BoolValue", v); c.Name="Collide"; c.Value=v.CanCollide
+					local r = Instance.new("NumberValue", v); r.Name="Ref";   r.Value=v.Reflectance
+					local c = Instance.new("BoolValue",  v); c.Name="Collide"; c.Value=v.CanCollide
 				end
 				table.insert(gearParts, v)
 			end
@@ -256,7 +235,7 @@ local function setupGearParts(landingGearInstance)
 	return gearParts
 end
 
--- [V4.0] Lowest point calculation (from modular script)
+-- Lowest point calc
 local function getLowestPoint(main, gearParts)
 	local lowestPoint = 0
 	if #gearParts == 0 then
@@ -297,13 +276,13 @@ local function initPlane(model: Model): PD?
 
 	local move, gyro = findOrCreateBodyMovers(main)
 
-	-- [V4.0] Setup gear parts and lowest point
+	-- Setup gear parts and lowest point
 	local gearParts = {}
 	if landing then
 		gearParts = setupGearParts(landing)
 	end
 	local lowestPoint = getLowestPoint(main, gearParts)
-	
+
 	local function mkSound(name, id, minVol, minPitch, rolloff)
 		if not id then return nil end
 		local s = Instance.new("Sound")
@@ -341,13 +320,11 @@ local function initPlane(model: Model): PD?
 		isBraking = false, landingTime = 0, hasBeenAirborne = false,
 
 		engineSound = mkSound("EngineSound", cfg.ENGINE_SOUND_ID, cfg.ENGINE_MIN_VOLUME, cfg.ENGINE_MIN_PITCH, cfg.ENGINE_SOUND_ROLLOFF),
-		windSound = mkSound("WindSound", cfg.WIND_SOUND_ID, 0, cfg.WIND_MIN_PITCH, cfg.WIND_SOUND_ROLLOFF),
+		windSound   = mkSound("WindSound",   cfg.WIND_SOUND_ID,   0,                   cfg.WIND_MIN_PITCH,   cfg.WIND_SOUND_ROLLOFF),
 
 		player = nil,
-		
-		-- [REFUEL ADDITION]
-		lastRefuelCheck = 0,
-		currentRefuelStation = nil,
+
+		fallAssist = 0,
 	}
 
 	-- Disable vanilla sitting; we will briefly enable when boarding
@@ -363,43 +340,25 @@ end
 local function calculateTransition(speed, transStart, transEnd)
 	if speed <= transStart then return 0 end
 	if speed >= transEnd then return 1 end
-	if (transEnd - transStart) == 0 then return 1 end -- Avoid divide by zero
+	if (transEnd - transStart) == 0 then return 1 end
 	return (speed - transStart) / (transEnd - transStart)
 end
 
--- [V4.0] 'taxi' function is for debug/state only
 local function isTaxiing(pd: PD)
 	local onGround = Workspace:FindPartOnRay(Ray.new(pd.main.Position, Vector3.new(0, -pd.lowestPoint, 0)), pd.plane)
 	return onGround and pd.currentSpeed <= pd.cfg.STALL_SPEED
 end
 
--- [V4.1] Stall logic now uses forwardSpeed
-local function stall(pd: PD, forwardSpeed: number)
+local function stall(pd: PD)
 	if pd.isBraking and pd.desiredSpeed < pd.cfg.STALL_SPEED then return false end
-	local diff = ((forwardSpeed - pd.cfg.STALL_SPEED) / 200) -- Use forwardSpeed
+	local diff = ((pd.realSpeed - pd.cfg.STALL_SPEED) / 200)
 	diff = (diff > 0.9 and 0.9 or diff)
 	local check = {
-		(forwardSpeed <= pd.cfg.STALL_SPEED), -- Use forwardSpeed
-		(pd.main.CFrame.lookVector.Y > (forwardSpeed < pd.cfg.STALL_SPEED and -1 or diff)) -- Use forwardSpeed
+		(pd.currentSpeed <= pd.cfg.STALL_SPEED),
+		(pd.main.CFrame.lookVector.Y > (pd.realSpeed < pd.cfg.STALL_SPEED and -1 or diff))
 	}
 	for _, c in ipairs(check) do if not c then return false end end
 	return true
-end
-
--- [V4.0] Gear logic from modular script
-local function changeGear(pd: PD)
-	pd.gear = not pd.gear
-	for _,v in ipairs(pd.gearParts) do
-		local t = v:FindFirstChild("Trans")
-		local r = v:FindFirstChild("Ref")
-		local c = v:FindFirstChild("Collide")
-		if t and r and c then
-			v.Transparency = (pd.gear and t.Value or 1)
-			-- [FIX] Removed invalid non-breaking space characters
-			v.Reflectance = (pd.gear and r.Value or 0)
-			v.CanCollide = (pd.gear and c.Value or false)
-		end
-	end
 end
 
 -- Activation
@@ -426,7 +385,7 @@ local function activate(pd: PD, plr: Player)
 	setForceCaps(pd, true)
 
 	if pd.engineSound then pd.engineSound:Play() end
-	if pd.windSound then pd.windSound:Play() end
+	if pd.windSound   then pd.windSound:Play()   end
 	if RE_Activate then pcall(function() RE_Activate:FireClient(plr, pd.plane, true) end) end
 end
 
@@ -448,91 +407,12 @@ local function deactivate(pd: PD)
 	pcall(function() pd.main:SetNetworkOwnershipAuto() end)
 
 	if pd.engineSound then pd.engineSound:Stop() end
-	if pd.windSound then pd.windSound:Stop() end
+	if pd.windSound   then pd.windSound:Stop() end
 	if RE_Activate and pd.player then pcall(function() RE_Activate:FireClient(pd.player, pd.plane, false) end) end
 	pd.on = false
 	pd.player = nil
 	pd.plane:SetAttribute("CurrentThrottle", 0)
 end
-
--- =======================
--- [REFUEL ADDITION - HELPER FUNCTIONS]
--- =======================
-local function iterRefuelStations()
-	-- Prefer CollectionService tag; fallback to scanning by name
-	local stations = {}
-	local ok, err = pcall(function()
-		local CS = game:GetService("CollectionService")
-		for _, inst in ipairs(CS:GetTagged(REFUEL_TAG)) do
-			if inst:IsA("BasePart") then table.insert(stations, inst) end
-		end
-	end)
-	if ok and #stations > 0 then
-		return stations
-	end
-
-	-- Fallback: name-based search (any BasePart named "RefuelStation")
-	for _, obj in ipairs(workspace:GetDescendants()) do
-		if obj:IsA("BasePart") and obj.Name == REFUEL_TAG then
-			table.insert(stations, obj)
-		end
-	end
-	return stations
-end
-
-local function findNearestRefuelStation(fromPos, maxDist)
-	local nearest, best = nil, maxDist or REFUEL_RADIUS_STUDS
-	for _, part in ipairs(iterRefuelStations()) do
-		local d = (part.Position - fromPos).Magnitude
-		if d < best then
-			nearest, best = part, d
-		end
-	end
-	return nearest, best
-end
-
--- pd fields expected:
--- pd.plane            : Model
--- pd.main             : BasePart
--- pd.lastRefuelCheck  : number (tick)
--- pd.currentRefuelStation : BasePart|nil
-local function stepRefuel(pd: PD, now: number)
-	if not pd or not pd.main or not pd.plane then return end
-	
-	-- Initialize lastRefuelCheck if it's 0
-	if pd.lastRefuelCheck == 0 then
-		pd.lastRefuelCheck = now
-	end
-
-	-- Respect check interval
-	if (now - pd.lastRefuelCheck) < REFUEL_CHECK_INTERVAL then return end
-	local dt = (now - pd.lastRefuelCheck)
-	pd.lastRefuelCheck = now
-
-	-- Look for the closest eligible station
-	local station, dist = findNearestRefuelStation(pd.main.Position, REFUEL_RADIUS_STUDS)
-	if not station then
-		pd.currentRefuelStation = nil
-		return
-	end
-
-	-- Within radius → add fuel proportional to dt
-	local currentFuel = pd.plane:GetAttribute("FuelRange") or 0
-	if currentFuel >= 1 then
-		pd.currentRefuelStation = station
-		return
-	end
-
-	local add = REFUEL_RATE_PER_SEC * dt
-	local newFuel = math.clamp(currentFuel + add, 0, 1)
-	pd.plane:SetAttribute("FuelRange", newFuel)
-	
-	pd.currentRefuelStation = station
-end
--- =======================
--- [END REFUEL ADDITION]
--- =======================
-
 
 -- =======================
 -- [CARGO KINGS - UNTOUCHED]
@@ -577,11 +457,10 @@ local function warpAndSit(player: Player, pd: PD): boolean
 
 	-- Move avatar to seat position (slightly above) and zero velocity
 	local seatCF = pd.seat.CFrame
-	local target = seatCF * CFrame.new(0, 2.0, -0.5) -- tiny offset so we drop into the seat
+	local target = seatCF * CFrame.new(0, 2.0, -0.5) -- drop into the seat
 	hrp.CFrame = target
 	if hrp.AssemblyLinearVelocity then hrp.AssemblyLinearVelocity = Vector3.zero end
 
-	-- Allow sit (will be disabled automatically when empty via updateSeatState)
 	pd.seat.Disabled = false
 	pd.seat:Sit(hum)
 
@@ -589,38 +468,34 @@ local function warpAndSit(player: Player, pd: PD): boolean
 end
 
 -- =======================
--- [PHYSICS UPDATE V4.4]
+-- [PHYSICS UPDATE V4.2]
 -- =======================
 local function update(pd: PD, input)
 	if not pd.on or not pd.player then return end
 	if not (input and input.viewSizeX and input.mouseX and input.mouseHit and input.mouseHitP) then return end
 
-	local cfg = pd.cfg -- Get config table
+	local cfg = pd.cfg
 
 	-- Direct delta time and speed calculation
 	local now = tick()
 	local dt = now - pd.lastTime
-	if dt <= 0 then return end -- No time passed, skip frame
+	if dt <= 0 then return end
 
-	-- [V4.1] Calculate *both* realSpeed (for sound) and forwardSpeed (for physics)
 	local dist = (pd.lastPos - pd.main.Position).Magnitude
-	pd.realSpeed = (dist / dt) -- Total magnitude for wind sound
-	
-	local velocity = pd.main.AssemblyLinearVelocity
-	local forwardSpeed = velocity:Dot(pd.main.CFrame.LookVector) -- True airspeed for physics
+	pd.realSpeed = (dist / dt) -- direct, no smoothing
 
 	pd.lastPos = pd.main.Position
 	pd.lastTime = now
-	
-	-- SAFETY: Void prevention check
+
+	-- SAFETY: Void prevention
 	if pd.main.Position.Y < cfg.VOID_THRESHOLD then
 		pd.main.CFrame = CFrame.new(pd.main.Position.X, 50, pd.main.Position.Z)
 		pd.main.AssemblyLinearVelocity = Vector3.new(0, -10, 0)
 		print("⚠️ VOID PREVENTION - Teleported to safety!")
 	end
 
-	-- [V4.1] Calculate transition factor using forwardSpeed
-	local transitionFactor = calculateTransition(forwardSpeed, cfg.TRANSITION_START, cfg.TRANSITION_END)
+	-- Transition factor
+	local transitionFactor = calculateTransition(pd.currentSpeed, cfg.TRANSITION_START, cfg.TRANSITION_END)
 
 	-- Fuel
 	local extFuel = pd.plane:GetAttribute("FuelRange")
@@ -658,36 +533,46 @@ local function update(pd: PD, input)
 		pd.isBraking = false
 	end
 
-	-- Sounds (use pd.realSpeed for total wind effect)
+	-- Sounds
 	if pd.engineSound then
 		local t = pd.throttle
 		pd.engineSound.Volume = cfg.ENGINE_MIN_VOLUME + (cfg.ENGINE_MAX_VOLUME - cfg.ENGINE_MIN_VOLUME) * t
-		-- [FIX] Removed invalid non-breaking space characters
-		pd.engineSound.Pitch = cfg.ENGINE_MIN_PITCH + (cfg.ENGINE_MAX_PITCH - cfg.ENGINE_MIN_PITCH ) * t
+		pd.engineSound.Pitch  = cfg.ENGINE_MIN_PITCH  + (cfg.ENGINE_MAX_PITCH  - cfg.ENGINE_MIN_PITCH ) * t
 	end
 	if pd.windSound then
 		local sPct = math.clamp((pd.realSpeed - cfg.WIND_START_SPEED) / (pd.maxSpeed - cfg.WIND_START_SPEED), 0, 1)
 		pd.windSound.Volume = cfg.WIND_MIN_VOLUME + (cfg.WIND_MAX_VOLUME - cfg.WIND_MIN_VOLUME) * sPct
-		-- [FIX] Removed invalid non-breaking space characters
-		pd.windSound.Pitch = cfg.WIND_MIN_PITCH + (cfg.WIND_MAX_PITCH - cfg.WIND_MIN_PITCH ) * sPct
+		pd.windSound.Pitch  = cfg.WIND_MIN_PITCH  + (cfg.WIND_MAX_PITCH  - cfg.WIND_MIN_PITCH ) * sPct
 	end
 
 	if RE_Throttle and pd.player then
-		-- [REFUEL ADDITION] Pass fuelRange to the throttle update
 		pcall(function() RE_Throttle:FireClient(pd.player, pd.throttle, pd.brakeThrottle, pd.fuelRange) end)
 	end
-
 	pd.plane:SetAttribute("CurrentThrottle", pd.throttle)
 
-	if input.landing then changeGear(pd) end
+	-- Gear toggle (uses tagged gear parts)
+	if input.landing then
+		pd.gear = not pd.gear
+		for _,v in ipairs(pd.gearParts or {}) do
+			local t = v:FindFirstChild("Trans")
+			local r = v:FindFirstChild("Ref")
+			local c = v:FindFirstChild("Collide")
+			if t and r and c then
+				v.Transparency = (pd.gear and t.Value or 1)
+				v.Reflectance  = (pd.gear and r.Value or 0)
+				v.CanCollide   = (pd.gear and c.Value or false)
+			end
+		end
+	end
 
+	-- Health/throttle multiplier
 	pd.throttle = pd.throttle * (pd.plane:GetAttribute("ThrottleMultiplier") or 1.0)
 
 	-- Speed model
 	local vary = -pd.main.CFrame.LookVector.Y * (pd.speedVary or 0)
 	local vmax = math.max(1, (pd.maxSpeed or 200) + vary)
 	local forward = vmax * pd.throttle
-	local brake = vmax * pd.brakeThrottle * cfg.BRAKE_FORCE_MULTIPLIER
+	local brake   = vmax * pd.brakeThrottle * cfg.BRAKE_FORCE_MULTIPLIER
 	pd.desiredSpeed = forward + brake
 
 	local change = (pd.desiredSpeed > pd.currentSpeed) and 1 or -1
@@ -695,29 +580,25 @@ local function update(pd: PD, input)
 	if change == 1 then
 		pd.currentSpeed = math.min(ns, pd.desiredSpeed)
 	else
-		-- [V4.1] Fix for the "no input" bug
 		pd.currentSpeed = math.max(ns, math.max(pd.desiredSpeed, -20))
 	end
 
-	-- [V4.1] Pass forwardSpeed to stall function
-	local stl = stall(pd, forwardSpeed)
+	local stl = stall(pd)
 
 	if pd.lastStall and not stl and not isTaxiing(pd) then
-		-- [V4.1] Use forwardSpeed for recovery
-		if not pd.isBraking and forwardSpeed > 10 and forwardSpeed < pd.maxSpeed then
-			local sd = forwardSpeed - pd.currentSpeed
+		if not pd.isBraking and pd.realSpeed > 10 and pd.realSpeed < pd.maxSpeed then
+			local sd = pd.realSpeed - pd.currentSpeed
 			pd.currentSpeed = pd.currentSpeed + (sd * 0.1)
 		end
 	end
 	pd.lastStall = stl
 
 	local onGround = Workspace:FindPartOnRay(Ray.new(pd.main.Position, Vector3.new(0, -pd.lowestPoint, 0)), pd.plane)
-	
-	-- [V4.1] Use forwardSpeed for landing detection
-	if not onGround and forwardSpeed > cfg.LANDING_MIN_AIR_SPEED then
+
+	if not onGround and pd.realSpeed > cfg.LANDING_MIN_AIR_SPEED then
 		pd.hasBeenAirborne = true
 	end
-	if onGround and pd.hasBeenAirborne and forwardSpeed > cfg.LANDING_DETECTION_SPEED and pd.landingTime == 0 then
+	if onGround and pd.hasBeenAirborne and pd.realSpeed > cfg.LANDING_DETECTION_SPEED and pd.landingTime == 0 then
 		pd.landingTime = now
 		pd.hasBeenAirborne = false
 		local cap = cfg.MAX_SAFE_FORCE * 0.3
@@ -733,93 +614,110 @@ local function update(pd: PD, input)
 		end
 	end
 
-	-- SAFETY: Check for dangerous stall+fall combination
-	local isStalling = stl
-	-- [V4.1] Use forwardSpeed for this check
-	local isFallingFast = not onGround and forwardSpeed < cfg.STALL_SPEED
+	-- Base velocity (forward along look vector)
+	local baseVelocity = pd.main.CFrame.LookVector * pd.currentSpeed
 
-	-- Velocity calculation with safety limits
-	local baseVelocity = pd.main.CFrame.lookVector * pd.currentSpeed
-
-	if isStalling and isFallingFast then
-		local maxDown = -80
-		if baseVelocity.Y < maxDown then
-			baseVelocity = Vector3.new(baseVelocity.X, maxDown, baseVelocity.Z)
+	-- Stall downward clamp
+	if stl and not onGround then
+		if baseVelocity.Y < -80 then
+			baseVelocity = Vector3.new(baseVelocity.X, -80, baseVelocity.Z)
 		end
 	end
-	
-	-- [V4.4] REMOVED 'fallSpeed' logic.
-	-- 'baseVelocity' is now the *only* target velocity.
-	
+
+	-- Orientation targets and authority
+	local rawBank = (((input.viewSizeX/2) - input.mouseX) / math.max(1, (input.viewSizeX/2))) * pd.maxBank
+	local bank = math.clamp(rawBank, -pd.maxBank, pd.maxBank)
+	local groundCFrame = CFrame.new(pd.main.Position, input.mouseHitP)
+	local flightCFrame = input.mouseHit * CFrame.Angles(0, 0, math.rad(bank))
+	local targetCFrame = groundCFrame:Lerp(flightCFrame, transitionFactor)
+
+	-- ===== v4.1 RECOVERY ASSIST =====
+	local targetLookY = targetCFrame.LookVector.Y
+	local noseUpIntent = math.clamp((-targetLookY - 0.02) / 0.6, 0, 1)
+	local throttleIntent = math.clamp((pd.throttle - 0.5) / 0.5, 0, 1)
+	local speedOK = (pd.currentSpeed >= (pd.cfg.STALL_SPEED * 0.85)) and 1 or 0
+	local recoveryIntent = math.clamp(0.65 * noseUpIntent + 0.35 * throttleIntent, 0, 1) * speedOK
+
+	local riseTau, decayTau = 0.20, 0.45
+	local k = dt / ((recoveryIntent > pd.fallAssist) and riseTau or decayTau)
+	k = math.clamp(k, 0, 1)
+	pd.fallAssist = pd.fallAssist + (recoveryIntent - pd.fallAssist) * k
+	-- ================================
+
+	-- Fall term
+	local fallSpeed = (1 - transitionFactor) * cfg.MAX_FALL_SPEED
+
+	-- Reduce fall by recovery assist (up to ~90%)
+	local effectiveFall = fallSpeed * (1 - 0.9 * pd.fallAssist)
+
+	-- Prevent extreme combined downward velocity
+	local totalDown = baseVelocity.Y - effectiveFall
+	if totalDown < -150 then
+		effectiveFall = effectiveFall * 0.5
+	end
+
+	-- Hard clamp forward magnitude before applying fall
 	if baseVelocity.Magnitude > cfg.MAX_VELOCITY then
 		baseVelocity = baseVelocity.Unit * cfg.MAX_VELOCITY
 	end
 
-	-- Banking/orientation
-	local bank = (((input.viewSizeX/2) - input.mouseX) / math.max(1, (input.viewSizeX/2))) * pd.maxBank
-	bank = math.clamp(bank, -pd.maxBank, pd.maxBank)
-
-	local groundCFrame = CFrame.new(pd.main.Position, input.mouseHitP)
-	local flightCFrame = input.mouseHit * CFrame.Angles(0, 0, math.rad(bank))
-
-	-- =================================================================
-	-- [V4.4] PHYSICS LOGIC (with natural gravity)
-	-- =================================================================
+	-- Gyro torque setup with sensitivities
 	local F = cfg.MAX_SAFE_FORCE
 	local pitchSensitivity = cfg.PITCH_SENSITIVITY or 1.0
-	local bankSensitivity = cfg.BANK_SENSITIVITY or 1.0
-	local liftMultiplier = cfg.LIFT_MULTIPLIER or 1.0
-	
-	-- Calculate flight control authority (based on forwardSpeed via transitionFactor)
+	local bankSensitivity  = cfg.BANK_SENSITIVITY  or 1.0
 	local targetPitchTorque = F * transitionFactor * pitchSensitivity
-	local targetBankTorque = F * transitionFactor * bankSensitivity -- [CHANGE] This is now scaled
-	
-	-- We ALWAYS lerp the CFrame. This scales pitch/bank authority from 0 to 100%.
-	local targetCFrame = groundCFrame:Lerp(flightCFrame, transitionFactor)
-	
-	local forceMult = isStalling and 0.3 or 1.0
-	-- Calculate lift using the multiplier (based on forwardSpeed via transitionFactor)
-	local yAxisForce = (F * liftMultiplier) * transitionFactor * forceMult
+	local targetBankTorque  = F * bankSensitivity
+
+	-- ===== v4.2: terminal fall speed (very small addition) =====
+	local TERMINAL_FALL_SPEED = cfg.TERMINAL_FALL_SPEED or 160
+	-- ==========================================================
 
 	if onGround then
-		pd.move.Velocity = baseVelocity -- No falling
+		pd.move.Velocity = baseVelocity -- no falling while grounded
 
 		if pd.currentSpeed < 2 then
-			-- At a dead stop, no forces, locked to ground
 			pd.move.MaxForce = Vector3.new(0, 0, 0)
 			pd.gyro.MaxTorque = Vector3.new(0, 0, 0)
 			pd.gyro.CFrame = groundCFrame
 		elseif inGrace then
-			-- Just landed, stabilize
 			pd.move.MaxForce = Vector3.new(F*0.1, F*0.05, F*0.1)
 			pd.gyro.MaxTorque = Vector3.new(0, F*0.1, 0)
 			pd.gyro.CFrame = groundCFrame
 		else
-			-- Taxi or Takeoff Roll
-			pd.move.MaxForce = Vector3.new(F, yAxisForce, F) -- <-- APPLY LIFT
-			
-			-- Use scaled torque/CFrame. This allows for smooth pull-up.
-			-- [FIX] Removed invalid non-breaking space characters
+			local forceMult = stl and 0.3 or 1.0
+			local yAxisForce = F * transitionFactor * forceMult
+			-- small Y-lift boost during recovery
+			yAxisForce = yAxisForce * (1 + 0.25 * pd.fallAssist)
+
+			pd.move.MaxForce = Vector3.new(F, yAxisForce, F)
 			pd.gyro.MaxTorque = Vector3.new(targetPitchTorque, F, targetBankTorque)
 			pd.gyro.CFrame = targetCFrame
 		end
 	else
-		-- In the air
-		-- [V4.4] Set velocity *only* to engine thrust.
-		-- The yAxisForce (lift) will fight gravity.
-		pd.move.Velocity = baseVelocity
-		
-		pd.move.MaxForce = Vector3.new(F * forceMult, yAxisForce, F * forceMult)
-		
-		-- Full flight controls
-		pd.gyro.MaxTorque = Vector3.new(targetPitchTorque, F, targetBankTorque)
-		pd.gyro.CFrame = targetCFrame -- CFrame lerp provides stability
-	end
-	-- =================================================================
-	-- [END V4.4 LOGIC]
-	-- =================================================================
+		-- In the air: apply forward + reduced fall
+		local vy = baseVelocity.Y - effectiveFall
+		if vy < -TERMINAL_FALL_SPEED then
+			vy = -TERMINAL_FALL_SPEED -- v4.2: cap commanded downward speed
+		end
+		pd.move.Velocity = Vector3.new(baseVelocity.X, vy, baseVelocity.Z)
 
-	-- Hard velocity clamp
+		local forceMult = stl and 0.3 or 1.0
+		local yAxisForce = F * transitionFactor * forceMult
+		-- boost Y-lift under recovery assist (max +35%)
+		yAxisForce = yAxisForce * (1 + 0.35 * pd.fallAssist)
+
+		pd.move.MaxForce = Vector3.new(F * forceMult, yAxisForce, F * forceMult)
+		pd.gyro.MaxTorque = Vector3.new(targetPitchTorque, F, targetBankTorque)
+		pd.gyro.CFrame = targetCFrame
+
+		-- Final downward clamp while airborne (safety)
+		local v = pd.main.AssemblyLinearVelocity
+		if v.Y < -TERMINAL_FALL_SPEED then
+			pd.main.AssemblyLinearVelocity = Vector3.new(v.X, -TERMINAL_FALL_SPEED, v.Z)
+		end
+	end
+
+	-- Hard velocity clamp (overall magnitude)
 	local vel = pd.main.AssemblyLinearVelocity
 	if vel.Magnitude > cfg.MAX_VELOCITY then
 		pd.main.AssemblyLinearVelocity = vel.Unit * (cfg.MAX_VELOCITY * 0.8)
@@ -862,7 +760,7 @@ local function bindPrompt(pd: PD)
 	prompt.ActionText = (pd.cfg and pd.cfg.PROMPT_TEXT) or "Pilot Plane"
 	prompt.HoldDuration = hold
 	prompt.KeyboardKeyCode = Enum.KeyCode.E
-	prompt.GamepadKeyCode = Enum.KeyCode.ButtonX
+	prompt.GamepadKeyCode  = Enum.KeyCode.ButtonX
 	prompt.MaxActivationDistance = PROMPT_RADIUS
 	prompt.RequiresLineOfSight = false
 	prompt.Enabled = true
@@ -879,8 +777,7 @@ local function bindPrompt(pd: PD)
 			return
 		end
 
-		-- Try to seat (warp + Sit), but don't announce success yet;
-		-- we'll wait for Occupant confirmation.
+		-- Try to seat (warp + Sit), but don't announce success yet
 		local attempted = warpAndSit(p, pd)
 
 		-- Fail-safe: if not seated within 1.0s, tell them to retry
@@ -900,7 +797,6 @@ local function bindPrompt(pd: PD)
 			if char then
 				local plr = Players:GetPlayerFromCharacter(char)
 				if plr then
-					-- start physics and confirm seating to player
 					activate(pd, plr)
 					notify(plr, "Seated. Prepare for taxi.", "Info")
 				end
@@ -930,22 +826,4 @@ Workspace.DescendantAdded:Connect(function(d)
 	task.defer(registerIfPlane, d)
 end)
 
--- =======================
--- [REFUEL ADDITION - PASSIVE LOOP]
--- =======================
--- This loop runs passively to check for refueling,
--- separate from the physics 'update' loop.
-RunService.Heartbeat:Connect(function()
-	local now = tick()
-	for _, pd in pairs(registry) do
-		-- Check if plane exists and is in the workspace
-		if pd.plane and pd.plane.Parent then
-			stepRefuel(pd, now)
-		end
-	end
-end)
--- =======================
--- [END REFUEL ADDITION]
--- =======================
-
-print("✅ UnifiedPlanePhysics v4.4 loaded (Natural Gravity Fix + Refuel Module)")
+print("✅ UnifiedPlanePhysics v4.2 loaded (Realistic Takeoff + Recovery Assist + Terminal Fall Clamp)")
