@@ -1,0 +1,599 @@
+-- ClientPlaneInput.lua (v4.0 - Reverted to original - Integrated smooth camera with desktop pan/zoom)
+-- Put this LocalScript in: StarterPlayer > StarterPlayerScripts
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local GuiService = game:GetService("GuiService")
+local Workspace = game:GetService("Workspace") -- Added Workspace reference
+
+-- ===== CAMERA CONFIG =====
+local CAMERA_DISTANCE = 40        -- Base distance behind plane
+local CAMERA_HEIGHT = 8           -- Height above plane
+local CAMERA_SMOOTHING = 0.15     -- Camera lag (higher = faster lock-on, lower = smoother lag)
+local MAX_ZOOM = 60           -- Farthest zoom out
+local MIN_ZOOM = 15           -- Closest zoom in
+local ZOOM_SPEED = 3          -- Mouse wheel zoom speed
+local ORBIT_SENSITIVITY = 0.3     -- Right-click orbit speed
+-- =========================
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+local playerGui = player:WaitForChild("PlayerGui")
+local camera = workspace.CurrentCamera -- Using workspace global is generally okay here
+
+-- Detect device type
+local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+local isDesktop = not isMobile and UserInputService.MouseEnabled
+
+-- ===== Remotes =====
+local remoteFolder = ReplicatedStorage:WaitForChild("PlaneRemotes", 10)
+if not remoteFolder then warn("❌ PlaneRemotes folder not found!"); return end
+
+local inputRemote    = remoteFolder:WaitForChild("PlaneInput", 5)
+local activateRemote = remoteFolder:WaitForChild("PlaneActivate", 5)
+local throttleRemote = remoteFolder:WaitForChild("ThrottleUpdate", 5)
+if not (inputRemote and activateRemote and throttleRemote) then
+	warn("❌ Failed to find plane remotes!")
+	return
+end
+
+-- ===== GUI: throttle/fuel bars (Existing GUI setup) =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "PlaneIndicators"
+gui.ResetOnSpawn = false
+gui.Enabled = false
+gui.Parent = playerGui
+
+local rangeBar = Instance.new("Frame")
+rangeBar.Size = UDim2.new(0, 26, 0, 300)
+rangeBar.Position = UDim2.new(0, 20, 1, -20)
+rangeBar.AnchorPoint = Vector2.new(0, 1)
+rangeBar.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
+rangeBar.BackgroundTransparency = 0.3
+rangeBar.BorderSizePixel = 0
+rangeBar.Parent = gui
+Instance.new("UICorner", rangeBar).CornerRadius = UDim.new(0,8)
+
+local throttleBar = Instance.new("Frame")
+throttleBar.Size = UDim2.new(0, 26, 0, 0)
+throttleBar.Position = UDim2.new(0, 56, 1, -20)
+throttleBar.AnchorPoint = Vector2.new(0, 1)
+throttleBar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+throttleBar.BackgroundTransparency = 0.3
+throttleBar.BorderSizePixel = 0
+throttleBar.Parent = gui
+Instance.new("UICorner", throttleBar).CornerRadius = UDim.new(0,8)
+
+local brakeBar = Instance.new("Frame")
+brakeBar.Size = UDim2.new(0, 26, 0, 0)
+brakeBar.Position = UDim2.new(0, 56, 1, -20)
+brakeBar.AnchorPoint = Vector2.new(0, 1)
+brakeBar.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+brakeBar.BackgroundTransparency = 0.3
+brakeBar.BorderSizePixel = 0
+brakeBar.Visible = false
+brakeBar.Parent = gui
+Instance.new("UICorner", brakeBar).CornerRadius = UDim.new(0,8)
+
+-- ===== Mobile HUD (Existing Mobile HUD setup) =====
+local mobileHud = Instance.new("ScreenGui")
+mobileHud.Name = "PlaneMobileHUD"
+mobileHud.ResetOnSpawn = false
+mobileHud.Enabled = false
+mobileHud.Parent = playerGui
+
+local function mkButton(name, anchor, pos, size, text)
+	local b = Instance.new("TextButton")
+	b.Name = name
+	b.AnchorPoint = anchor
+	b.Position = pos
+	b.Size = size
+	b.Text = text
+	b.TextScaled = true
+	b.BackgroundTransparency = 0.2
+	b.BackgroundColor3 = Color3.fromRGB(30,30,30)
+	b.TextColor3 = Color3.new(1,1,1)
+	b.AutoButtonColor = true
+	b.Parent = mobileHud
+	local corner = Instance.new("UICorner", b)
+	corner.CornerRadius = UDim.new(0,12)
+	return b
+end
+
+local throttleUpBtn   = mkButton("ThrottleUp",   Vector2.new(0,1), UDim2.new(0,20, 1,-90), UDim2.new(0,80, 0,80), "▲")
+local throttleDownBtn = mkButton("ThrottleDown", Vector2.new(0,1), UDim2.new(0,20, 1,-5),  UDim2.new(0,80, 0,80), "▼")
+local gearBtn = mkButton("Gear", Vector2.new(1,0), UDim2.new(1,-20, 0, 20), UDim2.new(0,120, 0,60), "Gear")
+
+-- ===== State =====
+local currentSeat, currentPlane
+local flying = false
+local keys = {
+	landing = {key = "g", down = false},
+	spdup   = {down = false},
+	spddwn  = {down = false}
+}
+local currentThrottle, currentBrake, targetThrottle, targetBrake = 0,0,0,0
+local currentRange, targetRange = 1,1
+
+-- Camera state (New variables for custom camera)
+local currentZoom = CAMERA_DISTANCE
+local isOrbiting = false
+local orbitX, orbitY = 0, 0
+local lastMouseX, lastMouseY = 0, 0
+local currentCameraPosition = nil  -- Track actual camera position
+local currentCameraLookAt = nil    -- Track where camera is looking
+local cameraConnection = nil       -- Connection for RenderStepped
+
+-- Gamepad look state (Existing)
+local gpRightX, gpRightY = 0, 0
+local gpHaveRecentLook = false
+local gpLookDecay = 0.9
+
+-- Touch look state (Original v4.0 - used for aiming on mobile/console)
+local touchLookId = nil
+local touchLookVec = Vector2.new()
+local haveRecentTouchLook = false
+
+-- ===== Helpers: Aim for mobile/console (Original v4.0) =====
+local function getAim()
+	-- On desktop, the aim is always the mouse position regardless of custom camera
+	if isDesktop then
+		return mouse.X, mouse.Y, mouse.ViewSizeX, mouse.ViewSizeY, mouse.Hit, mouse.Hit.p
+	end
+
+	-- On mobile/console, aim is derived from touch/thumbstick input
+	local cam = workspace.CurrentCamera
+	local origin = cam.CFrame.Position
+	local dir
+
+	local vx, vy = 0, 0
+	if haveRecentTouchLook then
+		vx, vy = touchLookVec.X, touchLookVec.Y
+	elseif gpHaveRecentLook then
+		vx, vy = gpRightX, gpRightY
+	end
+
+	local lookCF = cam.CFrame
+	local yaw   = vx * 0.7
+	local pitch = -vy * 0.5
+	local aimCF = lookCF * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
+	dir = aimCF.LookVector * 500
+
+	-- Uses DEPRECATED FindPartOnRay - Replace if needed
+	local ray = Ray.new(origin, dir)
+	local hitPart, hitPos = workspace:FindPartOnRay(ray, player.Character, false, true)
+	local fallbackPos = origin + dir
+	local hitCFrame = CFrame.new(fallbackPos)
+	if hitPart then
+		hitCFrame = CFrame.new(hitPos)
+	end
+
+	local vp = cam.ViewportSize
+	local cx, cy = math.floor(vp.X/2), math.floor(vp.Y/2)
+	return cx, cy, vp.X, vp.Y, hitCFrame, hitCFrame.Position
+end
+
+-- ===== Camera System (New custom camera) =====
+local function updatePlaneCamera(dt)
+	if not flying or not currentPlane then return end
+
+	local mainParts = currentPlane:FindFirstChild("MainParts")
+	if not mainParts then return end
+
+	local main = mainParts:FindFirstChild("Main")
+	if not main then return end
+
+	-- Initialize camera position if needed
+	if not currentCameraPosition then
+		currentCameraPosition = main.Position - main.CFrame.LookVector * CAMERA_DISTANCE + Vector3.new(0, CAMERA_HEIGHT, 0)
+		currentCameraLookAt = main.Position
+	end
+
+	-- Desktop Panning: Smooth orbit return when not holding right-click
+	if isDesktop and not isOrbiting then
+		orbitX = orbitX * 0.9  -- Decay orbit back to center
+		orbitY = orbitY * 0.9
+		if math.abs(orbitX) < 0.005 then orbitX = 0 end
+		if math.abs(orbitY) < 0.005 then orbitY = 0 end
+	end
+
+	-- Mobile is always centered, so orbit must be zeroed out
+	if isMobile then
+		orbitX = 0
+		orbitY = 0
+	end
+
+	-- Calculate desired camera position (simple follow from behind)
+	local desiredOffset = -main.CFrame.LookVector * currentZoom + Vector3.new(0, CAMERA_HEIGHT, 0)
+
+	-- Apply orbit rotation if active (Desktop only)
+	if isDesktop and (math.abs(orbitX) > 0.005 or math.abs(orbitY) > 0.005) then
+		local yaw = CFrame.Angles(0, orbitX, 0)
+		local pitch = CFrame.Angles(orbitY * 0.5, 0, 0)  -- Limit vertical orbit
+		desiredOffset = yaw:VectorToWorldSpace(pitch:VectorToWorldSpace(desiredOffset))
+	end
+
+	local desiredCameraPosition = main.Position + desiredOffset
+	local desiredLookAt = main.Position
+
+	-- Smooth camera movement (prevents choppiness)
+	currentCameraPosition = currentCameraPosition:Lerp(desiredCameraPosition, CAMERA_SMOOTHING)
+	currentCameraLookAt = currentCameraLookAt:Lerp(desiredLookAt, CAMERA_SMOOTHING * 2) -- Look target moves faster
+
+	-- Set camera CFrame
+	camera.CFrame = CFrame.lookAt(currentCameraPosition, currentCameraLookAt)
+end
+
+local function startCamera()
+	if not cameraConnection then
+		-- Use RenderStepped for visual smoothness
+		cameraConnection = RunService.RenderStepped:Connect(updatePlaneCamera)
+	end
+end
+
+local function stopCamera()
+	if cameraConnection then
+		cameraConnection:Disconnect()
+		cameraConnection = nil
+	end
+end
+-- ===========================================
+
+-- ===== GUI Animation (Existing Heartbeat loop) =====
+RunService.Heartbeat:Connect(function()
+	-- GUI updates (existing code)
+	currentThrottle = currentThrottle + (targetThrottle - currentThrottle) * 0.15
+	currentBrake    = currentBrake + (targetBrake    - currentBrake)    * 0.15
+	currentRange    = currentRange + (targetRange    - currentRange)    * 0.05
+
+	local throttleHeight = math.clamp(currentThrottle, 0, 1) * 300
+	throttleBar.Size = UDim2.new(0, 26, 0, throttleHeight)
+
+	if targetBrake > 0.01 or currentBrake > 0.01 then
+		brakeBar.Visible = true
+		local brakeHeight = math.clamp(currentBrake, 0, 1) * 300
+		brakeBar.Size = UDim2.new(0, 26, 0, brakeHeight)
+		brakeBar.BackgroundTransparency = 0.3
+	else
+		brakeBar.Visible = false
+	end
+
+	local rangeHeight = math.clamp(currentRange, 0, 1) * 300
+	rangeBar.Size = UDim2.new(0, 26, 0, rangeHeight)
+	if currentRange > 0.5 then
+		rangeBar.BackgroundColor3 = Color3.fromRGB(100, 255, 100)
+	elseif currentRange > 0.25 then
+		local blend = (currentRange - 0.25) / 0.25
+		rangeBar.BackgroundColor3 = Color3.fromRGB(255, 255, 100 * blend)
+	else
+		rangeBar.BackgroundColor3 = Color3.fromRGB(255, 100, 100)
+	end
+
+	if currentThrottle > 0.95 then
+		local pulse = math.sin(tick()*3)*0.2 + 0.3
+		throttleBar.BackgroundTransparency = pulse
+	else
+		throttleBar.BackgroundTransparency = 0.3
+	end
+
+	if currentRange < 0.1 then
+		local pulse = math.sin(tick()*5)*0.3 + 0.3
+		rangeBar.BackgroundTransparency = pulse
+	else
+		rangeBar.BackgroundTransparency = 0.3
+	end
+
+	if gpHaveRecentLook then
+		gpRightX *= gpLookDecay
+		gpRightY *= gpLookDecay
+		if math.abs(gpRightX) < 0.02 and math.abs(gpRightY) < 0.02 then
+			gpHaveRecentLook = false
+		end
+	end
+	if haveRecentTouchLook and (touchLookVec.Magnitude < 0.02) then
+		haveRecentTouchLook = false
+	end
+end)
+
+throttleRemote.OnClientEvent:Connect(function(throttle, brake, range)
+	targetThrottle = throttle or 0
+	targetBrake    = brake or 0
+	targetRange    = range or 1
+end)
+
+-- ===== Seat monitoring (Modified to use CameraType.Scriptable) =====
+local function onSeatChanged(active, seat)
+	if active and seat then
+		local isPlane = seat:FindFirstChild("IsPlane")
+		if not isPlane then return end
+		local plane = seat.Parent and seat.Parent.Parent
+		if not (plane and plane:FindFirstChild("MainParts")) then return end
+
+		currentSeat = seat
+		currentPlane = plane
+		flying = true
+		activateRemote:FireServer(plane, true)
+
+		-- Use Scriptable camera for custom control (pan/zoom)
+		workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+
+		-- Reset camera state
+		currentZoom = CAMERA_DISTANCE
+		orbitX, orbitY = 0, 0
+		currentCameraPosition = nil
+		currentCameraLookAt = nil
+		startCamera() -- Start the RenderStepped camera update loop
+
+		gui.Enabled = true
+		rangeBar.BackgroundTransparency = 1
+		throttleBar.BackgroundTransparency = 1
+		brakeBar.BackgroundTransparency = 1
+		brakeBar.Visible = false
+
+		TweenService:Create(rangeBar,   TweenInfo.new(0.5, Enum.EasingStyle.Quad), {BackgroundTransparency = 0.3}):Play()
+		TweenService:Create(throttleBar,TweenInfo.new(0.5, Enum.EasingStyle.Quad), {BackgroundTransparency = 0.3}):Play()
+
+		mobileHud.Enabled = isMobile
+
+	else
+		if flying then
+			flying = false
+
+			stopCamera() -- Stop the RenderStepped camera loop
+			workspace.CurrentCamera.CameraType = Enum.CameraType.Custom -- Restore player camera
+
+			if currentPlane then
+				activateRemote:FireServer(currentPlane, false)
+			end
+			currentSeat, currentPlane = nil, nil
+
+			TweenService:Create(rangeBar,   TweenInfo.new(0.5, Enum.EasingStyle.Quad), {BackgroundTransparency = 1}):Play()
+			TweenService:Create(throttleBar,TweenInfo.new(0.5, Enum.EasingStyle.Quad), {BackgroundTransparency = 1}):Play()
+			if brakeBar.Visible then
+				TweenService:Create(brakeBar, TweenInfo.new(0.5, Enum.EasingStyle.Quad), {BackgroundTransparency = 1}):Play()
+			end
+			task.delay(0.55, function()
+				gui.Enabled = false
+				mobileHud.Enabled = false
+				currentThrottle, currentBrake, targetThrottle, targetBrake = 0,0,0,0
+				currentRange, targetRange = 1,1
+				brakeBar.Visible = false
+			end)
+		end
+	end
+end
+
+player.CharacterAdded:Connect(function(character)
+	local humanoid = character:WaitForChild("Humanoid")
+	humanoid.Seated:Connect(onSeatChanged)
+end)
+if player.Character then
+	local humanoid = player.Character:FindFirstChild("Humanoid")
+	if humanoid then humanoid.Seated:Connect(onSeatChanged) end
+end
+
+-- ===== FIXED: Continuous input send loop (Existing) =====
+task.spawn(function()
+	while true do
+		if flying and currentPlane then
+			-- ALWAYS send inputs while flying (required for continuous throttle)
+			local mx, my, vx, vy, mHit, mHitP = getAim()
+
+			inputRemote:FireServer(currentPlane, {
+				mouseX = mx,
+				mouseY = my,
+				viewSizeX = vx,
+				viewSizeY = vy,
+				mouseHit = mHit,
+				mouseHitP = mHitP,
+				throttleUp = keys.spdup.down,
+				throttleDown = keys.spddwn.down,
+				landing = keys.landing.down
+			})
+		end
+		task.wait(0.05) -- Send 20 times/sec continuously
+	end
+end)
+
+-- ===== Input Handling (Zoom and Panning - Desktop Only) =====
+
+-- Mouse wheel zoom (Desktop Only)
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if not flying or gameProcessed or not isDesktop then return end
+
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		-- Apply zoom limits
+		currentZoom = math.clamp(currentZoom - input.Position.Z * ZOOM_SPEED, MIN_ZOOM, MAX_ZOOM)
+	end
+end)
+
+-- Right-click orbit (Desktop Only)
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not flying or gameProcessed or not isDesktop then return end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		isOrbiting = true
+		lastMouseX = mouse.X
+		lastMouseY = mouse.Y
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		isOrbiting = false
+	end
+end)
+
+-- Mouse movement for orbit (Desktop Only)
+mouse.Move:Connect(function()
+	if not flying or not isOrbiting or not isDesktop then return end
+
+	local deltaX = (mouse.X - lastMouseX) * ORBIT_SENSITIVITY * 0.01
+	local deltaY = (mouse.Y - lastMouseY) * ORBIT_SENSITIVITY * 0.01
+
+	orbitX = orbitX - deltaX
+	orbitY = math.clamp(orbitY - deltaY, -1, 1)
+
+	lastMouseX = mouse.X
+	lastMouseY = mouse.Y
+end)
+
+
+-- ===== Keyboard (PC) (Existing) =====
+mouse.KeyDown:Connect(function(k)
+	if not flying then return end
+	k = k:lower()
+	if k == "g" then
+		keys.landing.down = true
+	elseif k == "w" or k:byte() == 17 then
+		keys.spdup.down = true
+	elseif k == "s" or k:byte() == 18 then
+		keys.spddwn.down = true
+	end
+end)
+mouse.KeyUp:Connect(function(k)
+	k = k:lower()
+	if k == "g" then
+		keys.landing.down = false
+	elseif k == "w" or k:byte() == 17 then
+		keys.spdup.down = false
+	elseif k == "s" or k:byte() == 18 then
+		keys.spddwn.down = false
+	end
+end)
+
+-- ===== Mobile touch controls (Existing buttons) =====
+local function bindMobileButtons()
+	throttleUpBtn.MouseButton1Down:Connect(function()
+		if flying then keys.spdup.down = true end
+	end)
+	throttleUpBtn.MouseButton1Up:Connect(function()
+		keys.spdup.down = false
+	end)
+	throttleUpBtn.TouchLongPress:Connect(function(_,state)
+		-- Original v4.0 used Enum.LongPressState, check if this is correct
+		-- Corrected based on later versions to UserInputState
+		if state == Enum.UserInputState.Begin then keys.spdup.down = true end
+		if state == Enum.UserInputState.End   then keys.spdup.down = false end
+	end)
+
+	throttleDownBtn.MouseButton1Down:Connect(function()
+		if flying then keys.spddwn.down = true end
+	end)
+	throttleDownBtn.MouseButton1Up:Connect(function()
+		keys.spddwn.down = false
+	end)
+	throttleDownBtn.TouchLongPress:Connect(function(_,state)
+		-- Corrected based on later versions to UserInputState
+		if state == Enum.UserInputState.Begin then keys.spddwn.down = true end
+		if state == Enum.UserInputState.End   then keys.spddwn.down = false end
+	end)
+
+	gearBtn.MouseButton1Click:Connect(function()
+		if flying then
+			keys.landing.down = true
+			task.delay(0.1, function() keys.landing.down = false end)
+		end
+	end)
+end
+bindMobileButtons()
+
+-- ========================================================================
+-- ===== MOBILE STEERING SECTION - NEEDS IMPLEMENTATION =====
+-- ========================================================================
+-- The original v4.0 right-side drag logic below only updated a 2D vector
+-- (`touchLookVec`) which was used by `getAim` to calculate a steering
+-- direction. This direction was often inaccurate or caused instability.
+--
+-- Attempts to fix this included:
+-- 1. Tap-to-Steer: Tapping sets a static 3D world point.
+--    - Problem: Plane often circled the point or flew erratically because
+--      the server physics expects constantly updated input like a mouse.
+-- 2. Release-to-Hold-Target: Tapping/Dragging sets a 3D point, releasing
+--    keeps flying towards the *last* point.
+--    - Problem: Still unstable, likely due to CFrame orientation mismatch
+--      or gyro expecting dynamic updates.
+-- 3. Drag-to-Steer (like Desktop): Holding and dragging updates the 3D target.
+--    - Problem: Unstable flight. Various CFrame calculation methods tried:
+--      - CFrame.new(pos, pos + normal) for ground, CFrame.lookAt(pos, cameraPos) for sky
+--      - CFrame.fromMatrix using camera UpVector for sky
+--      - CFrame.new(pos) with identity rotation for sky
+--    - None provided stable flight matching desktop mouse control.
+-- 4. Client-Side Smoothing (Lerp): Added Lerp to the Drag-to-Steer CFrame.
+--    - Problem: Either too sluggish or still unstable depending on factor.
+--
+-- Conclusion: A different approach is likely needed. Perhaps a virtual joystick
+-- that directly controls pitch/yaw/roll inputs instead of calculating a 3D
+-- target point, or modifications to the server script to handle mobile's
+-- potentially less precise CFrame data differently.
+-- ========================================================================
+
+-- Original v4.0 Right-side drag = look (Used for aiming/steering on mobile)
+UserInputService.TouchStarted:Connect(function(touch, gp)
+	if not flying then return end
+	local vp = workspace.CurrentCamera.ViewportSize
+	if touch.Position.X > vp.X * 0.55 then
+		touchLookId = touch.InstanceId -- Note: Original used TouchId, maybe InstanceId is needed? Check API
+		touchLookVec = Vector2.new()
+		haveRecentTouchLook = true
+	end
+end)
+UserInputService.TouchMoved:Connect(function(touch, gp)
+	if not flying then return end
+	if touchLookId and touch.InstanceId == touchLookId then -- Check InstanceId
+		local delta = touch.Delta
+		touchLookVec = touchLookVec + Vector2.new(delta.X, delta.Y) * 0.002
+		touchLookVec = Vector2.new(math.clamp(touchLookVec.X, -1, 1), math.clamp(touchLookVec.Y, -1, 1))
+		haveRecentTouchLook = true
+	end
+end)
+UserInputService.TouchEnded:Connect(function(touch, gp)
+	if touchLookId and touch.InstanceId == touchLookId then -- Check InstanceId
+		touchLookId = nil
+	end
+end)
+
+-- ===== Console (gamepad) (Existing) =====
+local function gamepadActionThrottleUp(actionName, inputState, inputObj)
+	if not flying then return Enum.ContextActionResult.Pass end
+	if inputState == Enum.UserInputState.Begin then keys.spdup.down = true
+	elseif inputState == Enum.UserInputState.End then keys.spdup.down = false end
+	return Enum.ContextActionResult.Sink
+end
+local function gamepadActionThrottleDown(actionName, inputState, inputObj)
+	if not flying then return Enum.ContextActionResult.Pass end
+	if inputState == Enum.UserInputState.Begin then keys.spddwn.down = true
+	elseif inputState == Enum.UserInputState.End then keys.spddwn.down = false end
+	return Enum.ContextActionResult.Sink
+end
+local function gamepadActionGear(actionName, inputState, inputObj)
+	if not flying then return Enum.ContextActionResult.Pass end
+	if inputState == Enum.UserInputState.Begin then
+		keys.landing.down = true
+	elseif inputState == Enum.UserInputState.End then
+		keys.landing.down = false
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+ContextActionService:BindAction("Plane_ThrottleUp", gamepadActionThrottleUp, false, Enum.KeyCode.ButtonR2)
+ContextActionService:BindAction("Plane_ThrottleDown", gamepadActionThrottleDown, false, Enum.KeyCode.ButtonL2)
+ContextActionService:BindAction("Plane_Gear", gamepadActionGear, false, Enum.KeyCode.ButtonY)
+
+UserInputService.InputChanged:Connect(function(input, gp)
+	if not flying then return end
+	if input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode == Enum.KeyCode.Thumbstick2 then
+		local v = input.Position
+		gpRightX = v.X
+		gpRightY = v.Y
+		if math.abs(gpRightX) > 0.05 or math.abs(gpRightY) > 0.05 then
+			gpHaveRecentLook = true
+		end
+	end
+end)
+
+print("✅ CLIENT PLANE INPUT: Loaded (v4.0 REVERTED - Mobile steering needs implementation)")
