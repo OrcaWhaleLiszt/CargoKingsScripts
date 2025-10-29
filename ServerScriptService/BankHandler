@@ -1,0 +1,254 @@
+-- ServerScriptService/CargoKingsServer/BankHandler (Script)
+-- FINAL FIX: Waits for the suitcase to settle, then lifts it 1 stud before anchoring.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+
+local DataManager = require(script.Parent.DataManager)
+local BaseManager = require(script.Parent.BaseManager)
+local SuitcaseManager = require(script.Parent.SuitcaseManager)
+
+local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents", 10)
+local BankEvents = RemoteEvents and RemoteEvents:WaitForChild("BankEvents", 10)
+
+local LOG_BANK_DISPLAY_UPDATES = false
+local hasWarnedMissingPropModel = {} 
+
+-- (updateBankDisplay and findNearestBank functions are unchanged)
+local function updateBankDisplay(baseName, studCount)
+	local bases = Workspace:FindFirstChild("Bases"); if not bases then return end
+	local base = bases:FindFirstChild(baseName); if not base then return end
+	local propModel = base:FindFirstChild("PropModel"); if not propModel then return end
+	if hasWarnedMissingPropModel[baseName] then hasWarnedMissingPropModel[baseName] = nil end
+	local bank = propModel:FindFirstChild("BankWithdraw")
+	if not bank then
+		if not hasWarnedMissingPropModel[baseName] then
+			warn("⚠️ BankWithdraw not found in "..baseName.."/PropModel - check PropModel structure")
+			hasWarnedMissingPropModel[baseName] = true
+		end
+		return
+	end
+	local studCountGui = bank:FindFirstChild("StudCountGui")
+	if not studCountGui then
+		if not hasWarnedMissingPropModel[baseName] then
+			warn("⚠️ StudCountGui not found on BankWithdraw in "..baseName)
+			hasWarnedMissingPropModel[baseName] = true
+		end
+		return
+	end
+	local studLabel = studCountGui:FindFirstChild("StudLabel")
+	if studLabel then
+		studLabel.Text = tostring(studCount).." 💎"
+		if LOG_BANK_DISPLAY_UPDATES then
+			print(("📊 Updated %s bank display: %d studs"):format(baseName, studCount or 0))
+		end
+	end
+end
+
+local function findNearestBank(player)
+	local character = player.Character; if not character then return nil, nil end
+	local hrp = character:FindFirstChild("HumanoidRootPart"); if not hrp then return nil, nil end
+	local nearestBank, nearestBase = nil, nil
+	local nearestDistance = 30
+	local bases = Workspace:FindFirstChild("Bases"); if not bases then return nil, nil end
+	for _, base in ipairs(bases:GetChildren()) do
+		local propModel = base:FindFirstChild("PropModel")
+		if propModel then
+			local bank = propModel:FindFirstChild("BankWithdraw")
+			if bank then
+				local distance = (bank.Position - hrp.Position).Magnitude
+				if distance < nearestDistance then
+					nearestBank, nearestBase, nearestDistance = bank, base.Name, distance
+				end
+			end
+		end
+	end
+	return nearestBank, nearestBase
+end
+
+-- (BankEvents.OnServerEvent is unchanged)
+if BankEvents then
+	BankEvents.OnServerEvent:Connect(function(player, action, data)
+		if action == "WithdrawProgress" then
+			local percentage = tonumber(data) or 0
+			local bank, baseName = findNearestBank(player)
+			if not bank or not baseName then
+				BankEvents:FireClient(player, "WithdrawFailed", "Not near a bank")
+				return
+			end
+			local baseOwner = BaseManager.GetBaseOwner(baseName)
+			if not baseOwner then
+				BankEvents:FireClient(player, "WithdrawFailed", "Base has no owner")
+				return
+			end
+			local ownerData = DataManager.GetPlayerData(baseOwner)
+			if not ownerData then return end
+			local total = tonumber(ownerData.StudsStored or 0) or 0
+			if total <= 0 then
+				BankEvents:FireClient(player, "WithdrawFailed", "No studs to withdraw")
+				return
+			end
+			local studs = math.floor(total * math.clamp(percentage, 0, 1))
+			if studs <= 0 then return end
+			DataManager.AddToPlayerData(baseOwner, "StudsStored", -studs)
+			DataManager.AddToPlayerData(player, "StudsOnPlayer", studs)
+			local newTotal = ownerData.StudsStored or 0
+			updateBankDisplay(baseName, newTotal)
+			if player == baseOwner then
+				print(("🏦 %s withdrew %d studs from their own bank"):format(player.Name, studs))
+			else
+				print(("💰 %s STOLE %d studs from %s's bank!"):format(player.Name, studs, baseOwner.Name))
+			end
+			BankEvents:FireClient(player, "WithdrawSuccess", studs)
+			local pd = DataManager.GetPlayerData(player)
+			SuitcaseManager.updateSuitcase(player, pd and pd.StudsOnPlayer or 0)
+
+		elseif action == "DepositProgress" then
+			local percentage = tonumber(data) or 0
+			local pd = DataManager.GetPlayerData(player); if not pd then return end
+			local onPlayer = tonumber(pd.StudsOnPlayer or 0) or 0
+			if onPlayer <= 0 then
+				BankEvents:FireClient(player, "DepositFailed", "No studs to deposit")
+				return
+			end
+			local studs = math.floor(onPlayer * math.clamp(percentage, 0, 1))
+			if studs <= 0 then return end
+			DataManager.AddToPlayerData(player, "StudsOnPlayer", -studs)
+			DataManager.AddToPlayerData(player, "StudsStored", studs)
+			print(("🏦 %s deposited %d studs to their own storage"):format(player.Name, studs))
+			BankEvents:FireClient(player, "DepositSuccess", studs)
+			local pd2 = DataManager.GetPlayerData(player)
+			SuitcaseManager.updateSuitcase(player, pd2 and pd2.StudsOnPlayer or 0)
+			local baseName = BaseManager.GetPlayerBase(player)
+			if baseName then
+				updateBankDisplay(baseName, (pd and pd.StudsStored) or 0)
+			end
+		end
+	end)
+end
+
+-- (task.spawn for bank display is unchanged)
+task.spawn(function()
+	while task.wait(3) do
+		for _, player in ipairs(Players:GetPlayers()) do
+			local pd = DataManager.GetPlayerData(player)
+			if pd then
+				local baseName = BaseManager.GetPlayerBase(player)
+				if baseName then
+					updateBankDisplay(baseName, pd.StudsStored or 0)
+				end
+			end
+		end
+	end
+end)
+
+
+-- ================== REWRITTEN FUNCTION ==================
+-- This function now "lifts and anchors" the suitcase to prevent it from sinking
+local function handlePlayerDeath(player)
+	local pd = DataManager.GetPlayerData(player); if not pd then return end
+	local onPlayer = tonumber(pd.StudsOnPlayer or 0) or 0
+
+	if onPlayer > 0 then
+		local ch = player.Character
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+
+		if not hrp then 
+			DataManager.UpdatePlayerData(player, "StudsOnPlayer", 0)
+			SuitcaseManager.removeSuitcase(player) 
+			return 
+		end
+
+		-- 1. Detach the suitcase and get the HANDLE
+		local suitcaseHandle = SuitcaseManager.detachSuitcase(player, hrp.Position)
+		local suitcaseModel = suitcaseHandle and suitcaseHandle.Parent
+
+		if suitcaseHandle and suitcaseModel then
+			-- 2. Add the prompt *immediately* to the handle, but keep it disabled
+			local prompt = Instance.new("ProximityPrompt")
+			prompt.ActionText = "Collect Studs"
+			prompt.HoldDuration = 1
+			prompt.MaxActivationDistance = 8
+			prompt.Enabled = false -- Keep it disabled until it settles
+			prompt.Parent = suitcaseHandle
+
+			-- 3. Wait 2 seconds for the suitcase to fall and settle
+			task.wait(2) 
+
+			-- ================== THE FIX ==================
+			-- 4. After it settles, "LIFT" it 1 stud and ANCHOR it
+			if suitcaseHandle and suitcaseHandle.Parent then -- Check it still exists
+				-- Read its current position
+				local settledPosition = suitcaseHandle.Position
+				-- Move it up 1 stud to ensure it's above ground
+				suitcaseHandle.Position = settledPosition + Vector3.new(0, 1, 0) 
+
+				-- Now anchor it
+				suitcaseHandle.Anchored = true
+				suitcaseHandle.CanCollide = false 
+
+				-- And finally, enable the prompt
+				prompt.Enabled = true
+			end
+			-- ===============================================
+
+			-- 5. Set up the collection logic
+			prompt.Triggered:Connect(function(collector)
+				if suitcaseModel.Parent then -- Check if not already collected
+					DataManager.AddToPlayerData(collector, "StudsOnPlayer", onPlayer)
+					local cpd = DataManager.GetPlayerData(collector)
+					SuitcaseManager.updateSuitcase(collector, cpd and cpd.StudsOnPlayer or 0) 
+					suitcaseModel:Destroy()
+					print(("💰 %s collected %d studs from %s's dropped suitcase"):format(collector.Name, onPlayer, player.Name))
+				end
+			end)
+
+			-- 6. Add 30-second cleanup timer
+			Debris:AddItem(suitcaseModel, 30)
+			print(("💀 %s dropped their suitcase with %d studs"):format(player.Name, onPlayer))
+
+		end
+
+		-- 7. Set the dead player's data to 0
+		DataManager.UpdatePlayerData(player, "StudsOnPlayer", 0)
+	end
+end
+-- ========================================================
+
+-- (The rest of the script is unchanged)
+local function onCharacterAdded(player)
+	local character = player.Character; if not character then return end
+	local hum = character:WaitForChild("Humanoid")
+	task.wait(1)
+	local pd = DataManager.GetPlayerData(player)
+	if pd and (pd.StudsOnPlayer or 0) > 0 then
+		SuitcaseManager.updateSuitcase(player, pd.StudsOnPlayer)
+	end
+	hum.Died:Connect(function() handlePlayerDeath(player) end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function() onCharacterAdded(player) end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	SuitcaseManager.removeSuitcase(player)
+	local baseName = BaseManager.GetPlayerBase(player)
+	if baseName then hasWarnedMissingPropModel[baseName] = nil end
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	local pd = DataManager.GetPlayerData(player)
+	if pd and (pd.StudsOnPlayer or 0) > 0 then
+		SuitcaseManager.updateSuitcase(player, pd.StudsOnPlayer)
+	end
+	if player.Character then
+		onCharacterAdded(player)
+	end
+end
+
+print("🏦 BankHandler initialized")
+print(". . . Verbose suitcase logs: DISABLED")
+print(". . . Verbose display logs: "..(LOG_BANK_DISPLAY_UPDATES and "ENABLED" or "DISABLED"))
