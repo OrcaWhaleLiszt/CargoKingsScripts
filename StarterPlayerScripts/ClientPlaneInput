@@ -1,10 +1,12 @@
--- ClientPlaneInput.lua (v4.2-min — Default Roblox Camera, no custom camera code)
+-- OrcaCreations--
+-- Version 4.3: Added gentle tail alignment (horizontal-only drift, no jitter)
+-- Date: October 28, 2025
+-- Placement: StarterPlayer > StarterPlayerScripts (LocalScript)
+-- Name: ClientPlaneInput
+-- Context: Handles plane controls + tail alignment that drifts camera behind plane when idle
+
+-- ClientPlaneInput.lua (v4.3 - Tail Alignment)
 -- Put this LocalScript in: StarterPlayer > StarterPlayerScripts
---
--- NOTE:
--- • This version intentionally does NOT touch the camera at all.
--- • No Scriptable camera, no smoothing, no manual CFrame. Roblox default only.
--- • Physics update still runs locally to test jitter vs camera.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -27,7 +29,7 @@ local isDesktop = not isMobile and UserInputService.MouseEnabled
 local remoteFolder = ReplicatedStorage:WaitForChild("PlaneRemotes", 10)
 if not remoteFolder then warn("❌ PlaneRemotes folder not found!"); return end
 
-local inputRemote          = remoteFolder:WaitForChild("PlaneInput", 5)           -- kept for compatibility
+local inputRemote          = remoteFolder:WaitForChild("PlaneInput", 5)
 local activateRemote       = remoteFolder:WaitForChild("PlaneActivate", 5)
 local throttleRemote       = remoteFolder:WaitForChild("ThrottleUpdate", 5)
 local gearToggleRemote     = remoteFolder:WaitForChild("RE_GearToggle", 5)
@@ -106,7 +108,7 @@ local gearBtn         = mkButton("Gear", Vector2.new(1,0), UDim2.new(1,-20, 0, 2
 
 -- ===== STATE =====
 local currentSeat, currentPlane
-local currentPlaneData = nil -- client-side plane data ('pd')
+local currentPlaneData = nil
 local flying = false
 
 local keys = {
@@ -118,7 +120,7 @@ local keys = {
 local currentThrottle, currentBrake, targetThrottle, targetBrake = 0,0,0,0
 local currentRange, targetRange = 1,1
 
--- Gamepad/touch look state (used by mobile getAim)
+-- Gamepad/touch look state
 local gpRightX, gpRightY = 0, 0
 local gpHaveRecentLook = false
 local gpLookDecay = 0.9
@@ -128,7 +130,33 @@ local touchLookVec = Vector2.new()
 local haveRecentTouchLook = false
 
 -- ========================================================
--- HELPER FUNCTIONS (copied from server where needed)
+-- 🆕 CAMERA CONFIG (Attach mode + CameraOffset approach)
+-- ========================================================
+local MIN_ZOOM_DISTANCE = 15
+local MAX_ZOOM_DISTANCE = 60
+local savedMinZoom, savedMaxZoom = nil, nil
+
+-- Pan settings
+local ENABLE_DESKTOP_PAN = true
+local PAN_STUDS_PER_PIXEL_X = 0.012  -- Horizontal pan sensitivity
+local PAN_MAX_STUDS_X = 8            -- Max left/right pan
+local PAN_DECAY = 0.88               -- Recenter speed when RMB released
+
+local rmbHeld = false
+local lastMouseX = 0
+local panX = 0
+
+-- Helper to set CameraOffset (X only for horizontal pan)
+local function applyCameraOffsetX(x)
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	hum.CameraOffset = Vector3.new(x, 0, 0)
+end
+
+-- ========================================================
+-- HELPER FUNCTIONS
 -- ========================================================
 local function mkSound(main, name, id, minVol, minPitch, rolloff)
 	if not id then return nil end
@@ -241,7 +269,7 @@ local function getAim()
 end
 
 -- ========================================================
--- LOCAL PHYSICS UPDATE (entire v4.2 logic, runs client-side)
+-- LOCAL PHYSICS UPDATE
 -- ========================================================
 local crashDetectionState = {
 	wasHighSpeed = false,
@@ -260,7 +288,7 @@ local function update(pd, input, dt)
 	pd.realSpeed = (dist / dt)
 	pd.lastPos = pd.main.Position
 
-	-- Crash detect (speed drop)
+	-- Crash detect
 	local crashThreshold = cfg.CRASH_SPEED_THRESHOLD or 150
 	local now = tick()
 	if pd.realSpeed >= crashThreshold then
@@ -275,7 +303,6 @@ local function update(pd, input, dt)
 		elseif crashDetectionState.crashPending and (now - crashDetectionState.suddenDropTime) >= 0.5 then
 			print(("💥 CRASH DETECTED! Speed dropped from %d to %.1f"):format(crashThreshold, pd.realSpeed))
 			if crashRemote then
-				print("🔥 Firing crash remote to server...")
 				crashRemote:FireServer(pd.plane)
 			end
 			crashDetectionState.wasHighSpeed = false
@@ -300,7 +327,7 @@ local function update(pd, input, dt)
 
 	local transitionFactor = calculateTransition(pd.currentSpeed, cfg.TRANSITION_START, cfg.TRANSITION_END)
 
-	-- Fuel (server owns drain; client mirrors GUI target)
+	-- Fuel
 	pd.fuelRange = targetRange
 	if pd.fuelRange <= 0 then
 		pd.throttle = 0
@@ -329,7 +356,7 @@ local function update(pd, input, dt)
 		pd.isBraking = false
 	end
 
-	-- Local engine/wind sounds
+	-- Sounds
 	if pd.engineSound then
 		local t = pd.throttle
 		pd.engineSound.Volume = cfg.ENGINE_MIN_VOLUME + (cfg.ENGINE_MAX_VOLUME - cfg.ENGINE_MIN_VOLUME) * t
@@ -397,21 +424,20 @@ local function update(pd, input, dt)
 
 	local baseVelocity = pd.main.CFrame.LookVector * pd.currentSpeed
 
-	-- Stall downward clamp
 	if stl and not onGround then
 		if baseVelocity.Y < -80 then
 			baseVelocity = Vector3.new(baseVelocity.X, -80, baseVelocity.Z)
 		end
 	end
 
-	-- Orientation authority
+	-- Orientation
 	local rawBank = (((input.viewSizeX/2) - input.mouseX) / math.max(1, (input.viewSizeX/2))) * pd.maxBank
 	local bank = math.clamp(rawBank, -pd.maxBank, pd.maxBank)
 	local groundCFrame = CFrame.new(pd.main.Position, input.mouseHitP)
 	local flightCFrame = input.mouseHit * CFrame.Angles(0, 0, math.rad(bank))
 	local targetCFrame = groundCFrame:Lerp(flightCFrame, transitionFactor)
 
-	-- v4.2 Recovery assist
+	-- Recovery assist
 	local targetLookY = targetCFrame.LookVector.Y
 	local noseUpIntent = math.clamp((-targetLookY - 0.02) / 0.6, 0, 1)
 	local throttleIntent = math.clamp((pd.throttle - 0.5) / 0.5, 0, 1)
@@ -423,7 +449,6 @@ local function update(pd, input, dt)
 	k = math.clamp(k, 0, 1)
 	pd.fallAssist = pd.fallAssist + (recoveryIntent - pd.fallAssist) * k
 
-	-- Fall terms
 	local fallSpeed = (1 - transitionFactor) * cfg.MAX_FALL_SPEED
 	local effectiveFall = fallSpeed * (1 - 0.9 * pd.fallAssist)
 
@@ -432,12 +457,10 @@ local function update(pd, input, dt)
 		effectiveFall = effectiveFall * 0.5
 	end
 
-	-- Hard clamp forward magnitude before fall
 	if baseVelocity.Magnitude > cfg.MAX_VELOCITY then
 		baseVelocity = baseVelocity.Unit * cfg.MAX_VELOCITY
 	end
 
-	-- Gyro force setup
 	local F = cfg.MAX_SAFE_FORCE
 	local pitchSensitivity = cfg.PITCH_SENSITIVITY or 1.0
 	local bankSensitivity  = cfg.BANK_SENSITIVITY  or 1.0
@@ -485,11 +508,57 @@ local function update(pd, input, dt)
 		end
 	end
 
-	-- Hard overall velocity clamp
 	local vel = pd.main.AssemblyLinearVelocity
 	if vel.Magnitude > cfg.MAX_VELOCITY then
 		pd.main.AssemblyLinearVelocity = vel.Unit * (cfg.MAX_VELOCITY * 0.8)
 	end
+end
+
+-- ========================================================
+-- 🆕 TAIL ALIGNMENT FUNCTION (ClientCameraSystem style)
+-- Full chase cam with free look and zoom
+-- ========================================================
+local function updateTailAlign()
+	if not flying then return end
+	if not currentPlaneData then return end
+
+	local camera = workspace.CurrentCamera
+	if not camera then return end
+	
+	local main = currentPlaneData.main
+	if not main then return end
+	if not main.Parent then return end
+
+	-- Handle mouse movement for free look
+	if isFreeLooking then
+		local deltaX = mouse.X - lastMouseX
+		local deltaY = mouse.Y - lastMouseY
+		
+		deltaX = deltaX * FREELOOK_SENSITIVITY * 0.01
+		deltaY = deltaY * FREELOOK_SENSITIVITY * 0.01
+		
+		freeLookOffset = freeLookOffset * CFrame.fromEulerAnglesYXZ(-deltaY, -deltaX, 0)
+		
+		lastMouseX = mouse.X
+		lastMouseY = mouse.Y
+	end
+
+	-- Calculate chase position (behind + above plane)
+	local planeCF = main.CFrame
+	local backwardVector = -planeCF.LookVector * currentZoomDistance
+	local upwardVector = Vector3.new(0, CHASE_HEIGHT, 0)
+	local cameraPosition = planeCF.Position + backwardVector + upwardVector
+
+	-- Base camera orientation (look at plane)
+	local targetCF = CFrame.lookAt(cameraPosition, planeCF.Position, Vector3.new(0, 1, 0))
+
+	-- Apply free look offset if active
+	if isFreeLooking then
+		targetCF = targetCF * freeLookOffset
+	end
+
+	-- Smooth lerp to target
+	camera.CFrame = camera.CFrame:Lerp(targetCF, FOLLOW_SMOOTHING)
 end
 
 -- ===== GUI Animation =====
@@ -553,7 +622,7 @@ throttleRemote.OnClientEvent:Connect(function(throttle, brake, range)
 	targetRange    = range or 1
 end)
 
--- ===== Seat monitoring (Simplified — NO camera manipulation) =====
+-- ===== Seat monitoring =====
 local function onSeatChanged(active, seat)
 	if active and seat then
 		local isPlane = seat:FindFirstChild("IsPlane")
@@ -566,7 +635,7 @@ local function onSeatChanged(active, seat)
 		flying = true
 		activateRemote:FireServer(plane, true)
 
-		-- Build local pd
+		-- Build local plane data
 		pcall(function()
 			local mainParts = currentPlane:FindFirstChild("MainParts")
 			local main = mainParts:FindFirstChild("Main")
@@ -600,20 +669,16 @@ local function onSeatChanged(active, seat)
 				stallSpeed = math.min(cfg.STALL_SPEED, cfg.MAX_SPEED),
 
 				desiredSpeed = 0, currentSpeed = 0, realSpeed = 0,
-
 				throttle = 0, brakeThrottle = 0,
 				fuelRange = currentPlane:GetAttribute("FuelRange") or 1.0,
 
 				on = true, dead = false, gear = true,
-
 				lastPos = main.Position, lastTime = tick(), lastStall = false,
 				isBraking = false, landingTime = 0, hasBeenAirborne = false,
 
 				engineSound = engineSound,
 				windSound = windSound,
-
 				player = player,
-
 				fallAssist = 0,
 			}
 
@@ -621,8 +686,23 @@ local function onSeatChanged(active, seat)
 			if currentPlaneData.windSound then   currentPlaneData.windSound:Play()   end
 		end)
 
-		-- Force default camera mode explicitly (optional but harmless)
-		workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+		-- 🆕 Use Attach camera (smooth like VehicleSeat)
+		workspace.CurrentCamera.CameraType = Enum.CameraType.Attach
+
+		-- 🆕 Clamp zoom while seated
+		if savedMinZoom == nil then
+			savedMinZoom = player.CameraMinZoomDistance
+			savedMaxZoom = player.CameraMaxZoomDistance
+		end
+		player.CameraMinZoomDistance = MIN_ZOOM_DISTANCE
+		player.CameraMaxZoomDistance = MAX_ZOOM_DISTANCE
+
+		-- Reset pan
+		rmbHeld = false
+		panX = 0
+		applyCameraOffsetX(0)
+
+		print("✈️ Camera: Attach mode with pan + zoom limits")
 
 		gui.Enabled = true
 		rangeBar.BackgroundTransparency = 1
@@ -638,8 +718,21 @@ local function onSeatChanged(active, seat)
 	else
 		if flying then
 			flying = false
+			
+			-- 🆕 Restore camera to Custom mode
+			workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+			
+			-- 🆕 Restore zoom limits
+			if savedMinZoom ~= nil then
+				player.CameraMinZoomDistance = savedMinZoom
+				player.CameraMaxZoomDistance = savedMaxZoom
+				savedMinZoom, savedMaxZoom = nil, nil
+			end
 
-			-- Clean up local sounds/state
+			-- Clear pan offset
+			applyCameraOffsetX(0)
+
+			-- Clean up
 			if currentPlaneData then
 				if currentPlaneData.engineSound then currentPlaneData.engineSound:Destroy() end
 				if currentPlaneData.windSound   then currentPlaneData.windSound:Destroy()   end
@@ -676,7 +769,7 @@ if player.Character then
 	if humanoid then humanoid.Seated:Connect(onSeatChanged) end
 end
 
--- ===== CONTINUOUS PHYSICS LOOP (Heartbeat-timed) =====
+-- ===== PHYSICS LOOP =====
 local lastPhysicsUpdate = tick()
 task.spawn(function()
 	while true do
@@ -697,7 +790,6 @@ task.spawn(function()
 			}
 			pcall(update, currentPlaneData, input, dt)
 
-			-- lightweight throttle sync (every ~0.1s)
 			if tick() % 0.1 < dt then
 				throttleSyncRemote:FireServer(currentPlane, currentPlaneData.throttle)
 			end
@@ -707,7 +799,80 @@ task.spawn(function()
 	end
 end)
 
--- ===== DESKTOP KEYBOARD =====
+-- ========================================================
+-- 🆕 CAMERA INPUT DETECTION (RMB free look + Mouse wheel zoom)
+-- ========================================================
+
+-- RMB hold for free look
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if not flying then return end
+	
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		isFreeLooking = true
+		lastMouseX = mouse.X
+		lastMouseY = mouse.Y
+		print("🔓 Free look activated")
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input, gameProcessed)
+	if input.UserInputType == Enum.UserInputType.MouseButton2 then
+		isFreeLooking = false
+		freeLookOffset = CFrame.new() -- Snap back
+		print("🔒 Free look deactivated - snapped back")
+	end
+end)
+
+-- Mouse wheel zoom
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if not flying then return end
+	
+	if input.UserInputType == Enum.UserInputType.MouseWheel then
+		local zoomChange = input.Position.Z * ZOOM_SPEED
+		local oldZoom = currentZoomDistance
+		currentZoomDistance = math.clamp(
+			currentZoomDistance - zoomChange, -- Inverted for intuitive zoom
+			CHASE_DISTANCE,
+			MAX_ZOOM_DISTANCE
+		)
+		print(("🔍 Zoom: %.1f → %.1f"):format(oldZoom, currentZoomDistance))
+	end
+end)
+
+-- Desktop mouse movement (already exists, keep for compatibility)
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if not flying then return end
+	-- Could add input damping here if needed
+end)
+
+-- Desktop RMB drag
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not flying then return end
+	-- Could pause alignment here if needed
+end)
+
+-- Mobile/Console gamepad right stick
+UserInputService.InputChanged:Connect(function(input, gameProcessed)
+	if not flying then return end
+	if input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode == Enum.KeyCode.Thumbstick2 then
+		local v = input.Position
+		gpRightX = v.X
+		gpRightY = v.Y
+		if math.abs(gpRightX) > 0.05 or math.abs(gpRightY) > 0.05 then
+			gpHaveRecentLook = true
+		end
+	end
+end)
+
+-- Mobile touch look
+UserInputService.TouchMoved:Connect(function(touch, gameProcessed)
+	if not flying then return end
+	-- Could pause alignment here if needed
+end)
+
+-- ===== KEYBOARD =====
 mouse.KeyDown:Connect(function(k)
 	if not flying then return end
 	k = k:lower()
@@ -762,12 +927,11 @@ local function bindMobileButtons()
 end
 bindMobileButtons()
 
--- ===== MOBILE / CONSOLE LOOK (right-side drag / thumbstick) =====
+-- ===== MOBILE/CONSOLE LOOK =====
 UserInputService.TouchStarted:Connect(function(touch, gp)
 	if not flying then return end
 	local vp = workspace.CurrentCamera.ViewportSize
 	if touch.Position.X > vp.X * 0.55 then
-		-- NOTE: this uses UserInputState as the "id" (simple heuristic kept from your version)
 		touchLookId = touch.UserInputState
 		touchLookVec = Vector2.new()
 		haveRecentTouchLook = true
@@ -788,7 +952,7 @@ UserInputService.TouchEnded:Connect(function(touch, gp)
 	end
 end)
 
--- Gamepad throttle + look
+-- Gamepad
 local function gamepadActionThrottleUp(actionName, inputState, inputObj)
 	if not flying then return Enum.ContextActionResult.Pass end
 	if inputState == Enum.UserInputState.Begin then keys.spdup.down = true
@@ -815,16 +979,8 @@ ContextActionService:BindAction("Plane_ThrottleUp",   gamepadActionThrottleUp,  
 ContextActionService:BindAction("Plane_ThrottleDown", gamepadActionThrottleDown, false, Enum.KeyCode.ButtonL2)
 ContextActionService:BindAction("Plane_Gear",         gamepadActionGear,         false, Enum.KeyCode.ButtonY)
 
-UserInputService.InputChanged:Connect(function(input, gp)
-	if not flying then return end
-	if input.UserInputType == Enum.UserInputType.Gamepad1 and input.KeyCode == Enum.KeyCode.Thumbstick2 then
-		local v = input.Position
-		gpRightX = v.X
-		gpRightY = v.Y
-		if math.abs(gpRightX) > 0.05 or math.abs(gpRightY) > 0.05 then
-			gpHaveRecentLook = true
-		end
-	end
-end)
-
-print("✅ CLIENT PLANE INPUT: Loaded (v4.2-min — default camera, no custom camera code)")
+print("✅ CLIENT PLANE INPUT v4.3: Loaded with Attach camera + horizontal pan")
+print("   🖱️ Hold RMB + drag = Horizontal pan (smooth recenter)")
+print("   🔍 Mouse wheel = Zoom (15-60 studs, clamped while flying)")
+print("   📱 Mobile = Centered view (no pan)")
+print("   🎮 Decay rate: " .. PAN_DECAY .. " | Max pan: ±" .. PAN_MAX_STUDS_X .. " studs")
