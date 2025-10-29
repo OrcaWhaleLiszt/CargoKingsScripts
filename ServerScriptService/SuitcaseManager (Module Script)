@@ -1,0 +1,183 @@
+-- ServerScriptService/CargoKingsServer/SuitcaseManager (ModuleScript)
+-- Purpose: Manages all suitcase visuals (create, update, remove)
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local M = {}
+
+local playerSuitcases = {}
+local LOG_SUITCASE_UPDATES = false -- Set to true for debugging
+
+-- (This function is unchanged)
+local function createSuitcaseModel()
+	local Assets = ReplicatedStorage:FindFirstChild("Assets")
+	if Assets then
+		local prefab = Assets:FindFirstChild("KiloBriefcase")
+		if prefab then return prefab:Clone() end
+	end
+	local model = Instance.new("Model")
+	model.Name = "Suitcase"
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(1.5, 0.8, 1)
+	handle.Color = Color3.fromRGB(101, 67, 33)
+	handle.Material = Enum.Material.Leather
+	handle.CanCollide = false
+	handle.Anchored = false
+	handle.Parent = model
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.Brick
+	mesh.Scale = Vector3.new(0.9, 0.8, 0.9)
+	mesh.Parent = handle
+	model.PrimaryPart = handle
+	return model
+end
+
+-- (This function is unchanged)
+local function attachSuitcase(player, studCount)
+	if playerSuitcases[player] then
+		playerSuitcases[player]:Destroy()
+		playerSuitcases[player] = nil
+	end
+	local character = player.Character
+	if not character then return end
+
+	local leftArm = character:FindFirstChild("LeftHand") or character:FindFirstChild("Left Arm") or character:FindFirstChild("LeftLowerArm")
+	if not leftArm then
+		warn("⚠️ Could not find left arm for "..player.Name)
+		return
+	end
+
+	local suitcase = createSuitcaseModel()
+	suitcase.Name = "Studs"
+	suitcase.Parent = character
+	local handle = suitcase.PrimaryPart or suitcase:FindFirstChildOfClass("BasePart")
+
+	local billboardGui = Instance.new("BillboardGui")
+	billboardGui.Name = "StudCounter"
+	billboardGui.Size = UDim2.new(0, 100, 0, 40)
+	billboardGui.StudsOffset = Vector3.new(0, 2, 0)
+	billboardGui.AlwaysOnTop = true
+	billboardGui.Parent = handle
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 1, 0)
+	label.BackgroundTransparency = 1
+	label.Text = tostring(studCount) .. " 💎"
+	label.TextScaled = true
+	label.Font = Enum.Font.GothamBold
+	label.TextStrokeTransparency = 0
+	label.Parent = billboardGui
+
+	if studCount >= 100 then
+		label.TextColor3 = Color3.fromRGB(255, 100, 100)
+	elseif studCount >= 50 then
+		label.TextColor3 = Color3.fromRGB(255, 150, 100)
+	else
+		label.TextColor3 = Color3.fromRGB(255, 255, 100)
+	end
+
+	local armAttachment = Instance.new("Attachment")
+	armAttachment.Name = "SuitcaseAttachment"
+	armAttachment.Position = Vector3.new(0, -0.5, 0)
+	armAttachment.Parent = leftArm
+
+	local suitcaseAttachment = Instance.new("Attachment")
+	suitcaseAttachment.Name = "ArmAttachment"
+	suitcaseAttachment.Position = Vector3.new(0, 0.5, 0)
+	suitcaseAttachment.Parent = handle
+
+	local weld = Instance.new("RigidConstraint")
+	weld.Attachment0 = armAttachment
+	weld.Attachment1 = suitcaseAttachment
+	weld.Parent = handle
+
+	playerSuitcases[player] = suitcase
+	if LOG_SUITCASE_UPDATES then
+		print(("💼 Suitcase attached to %s with %d studs"):format(player.Name, studCount))
+	end
+end
+
+-- (This function is unchanged)
+function M.removeSuitcase(player)
+	if playerSuitcases[player] then
+		playerSuitcases[player]:Destroy()
+		playerSuitcases[player] = nil
+		if LOG_SUITCASE_UPDATES then
+			print(("💼 Suitcase removed from %s"):format(player.Name))
+		end
+	end
+end
+
+-- (This function is unchanged)
+function M.updateSuitcase(player, studCount)
+	if (studCount or 0) > 0 then
+		if playerSuitcases[player] then
+			local billboard = playerSuitcases[player]:FindFirstChild("StudCounter", true)
+			local label = billboard and billboard:FindFirstChild("TextLabel")
+			if label then
+				label.Text = tostring(studCount).." 💎"
+				if studCount >= 100 then
+					label.TextColor3 = Color3.fromRGB(255, 100, 100)
+				elseif studCount >= 50 then
+					label.TextColor3 = Color3.fromRGB(255, 150, 100)
+				else
+					label.TextColor3 = Color3.fromRGB(255, 255, 100)
+				end
+			end
+		else
+			attachSuitcase(player, studCount)
+		end
+	else
+		M.removeSuitcase(player)
+	end
+end
+
+-- ================== UPDATED FUNCTION ==================
+-- This function now sets the collision group to prevent physics glitches
+function M.detachSuitcase(player, deathPosition)
+	local suitcase = playerSuitcases[player]
+	if not suitcase then return nil end
+
+	-- Stop tracking the suitcase so it doesn't get updated
+	playerSuitcases[player] = nil
+
+	local handle = suitcase.PrimaryPart
+	if handle then
+		-- 1. Break the weld
+		local weld = handle:FindFirstChildOfClass("RigidConstraint")
+		if weld then weld:Destroy() end
+
+		local handleAtt = handle:FindFirstChild("ArmAttachment")
+		if handleAtt then handleAtt:Destroy() end
+
+		-- 2. Find the arm attachment on the character and destroy it
+		if player.Character then
+			local armAtt = player.Character:FindFirstChild("SuitcaseAttachment", true)
+			if armAtt then armAtt:Destroy() end
+		end
+	end
+
+	-- 3. Parent to workspace so it doesn't get destroyed
+	suitcase.Parent = Workspace
+
+	-- 4. Set its position *above* the ground
+	suitcase:SetPrimaryPartCFrame(CFrame.new(deathPosition + Vector3.new(0, 3, 0)))
+
+	-- 5. Make it a physics object so it falls naturally
+	if handle then
+		handle.Anchored = false
+		handle.CanCollide = true
+		-- ================== THE FIX ==================
+		-- This stops the dead body from flinging the suitcase
+		handle.CollisionGroup = "DroppedItems" 
+		-- ===============================================
+	end
+
+	-- 6. Return the HANDLE, not the model
+	return handle
+end
+-- ===============================================
+
+return M
