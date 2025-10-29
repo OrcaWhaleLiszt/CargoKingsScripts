@@ -1,0 +1,90 @@
+-- PlaneRemoteSetup.lua
+-- Put this in: ServerScriptService
+-- Run BEFORE any plane scripts load
+-- Creates shared RemoteEvents for all plane scripts
+
+print("🔧 Setting up shared plane remotes...")
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- Create or get PlaneRemotes folder
+local planeRemotes = ReplicatedStorage:FindFirstChild("PlaneRemotes")
+if not planeRemotes then
+	planeRemotes = Instance.new("Folder")
+	planeRemotes.Name = "PlaneRemotes"
+	planeRemotes.Parent = ReplicatedStorage
+	print("✅ Created PlaneRemotes folder")
+else
+	print("✅ PlaneRemotes folder already exists")
+end
+
+-- Create PlaneInput RemoteEvent
+local planeInput = planeRemotes:FindFirstChild("PlaneInput")
+if not planeInput then
+	planeInput = Instance.new("RemoteEvent")
+	planeInput.Name = "PlaneInput"
+	planeInput.Parent = planeRemotes
+	print("✅ Created PlaneInput RemoteEvent")
+else
+	print("✅ PlaneInput already exists")
+end
+
+-- Create PlaneActivate RemoteEvent
+local planeActivate = planeRemotes:FindFirstChild("PlaneActivate")
+if not planeActivate then
+	planeActivate = Instance.new("RemoteEvent")
+	planeActivate.Name = "PlaneActivate"
+	planeActivate.Parent = planeRemotes
+	print("✅ Created PlaneActivate RemoteEvent")
+else
+	print("✅ PlaneActivate already exists")
+end
+
+-- Create ThrottleUpdate RemoteEvent
+local throttleUpdate = planeRemotes:FindFirstChild("ThrottleUpdate")
+if not throttleUpdate then
+	throttleUpdate = Instance.new("RemoteEvent")
+	throttleUpdate.Name = "ThrottleUpdate"
+	throttleUpdate.Parent = planeRemotes
+	print("✅ Created ThrottleUpdate RemoteEvent")
+else
+	print("✅ ThrottleUpdate already exists")
+end
+
+-- ===== NEW REMOTES FOR CLIENT-SIDED PHYSICS =====
+
+-- Create RE_GearToggle RemoteEvent
+local gearToggle = planeRemotes:FindFirstChild("RE_GearToggle")
+if not gearToggle then
+	gearToggle = Instance.new("RemoteEvent")
+	gearToggle.Name = "RE_GearToggle"
+	gearToggle.Parent = planeRemotes
+	print("✅ Created RE_GearToggle RemoteEvent")
+else
+	print("✅ RE_GearToggle already exists")
+end
+
+-- Create RE_ThrottleSync RemoteEvent
+local throttleSync = planeRemotes:FindFirstChild("RE_ThrottleSync")
+if not throttleSync then
+	throttleSync = Instance.new("RemoteEvent")
+	throttleSync.Name = "RE_ThrottleSync"
+	throttleSync.Parent = planeRemotes
+	print("✅ Created RE_ThrottleSync RemoteEvent")
+else
+	print("✅ RE_ThrottleSync already exists")
+end
+
+-- Create PlaneCrash RemoteEvent
+local planeCrash = planeRemotes:FindFirstChild("PlaneCrash")
+if not planeCrash then
+	planeCrash = Instance.new("RemoteEvent")
+	planeCrash.Name = "PlaneCrash"
+	planeCrash.Parent = planeRemotes
+	print("✅ Created PlaneCrash RemoteEvent")
+else
+	print("✅ PlaneCrash already exists")
+end
+
+print("✅ Plane remotes ready!")
+print("Hello world!")
