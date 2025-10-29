@@ -8,6 +8,9 @@ Placement: ServerScriptService (centralized for all planes)
 Combined with v4.4 Refuel Module (by Gemini)
 - Physics are 100% v4.2 (assisted fall)
 - Refuel logic is from v4.4 (standalone)
+
+MODIFIED: Physics calculations (update function) moved to client for smoothness.
+Server now only handles fuel, gear replication, and network ownership.
 ]]--
 
 local Players = game:GetService("Players")
@@ -19,9 +22,16 @@ local ServerScriptService = game:GetService("ServerScriptService")
 -- Remotes
 local Remotes = ReplicatedStorage:WaitForChild("PlaneRemotes", 10)
 if not Remotes then error("❌ ReplicatedStorage.PlaneRemotes missing") end
-local RE_Input = Remotes:WaitForChild("PlaneInput", 10)
+local RE_Input = Remotes:WaitForChild("PlaneInput", 10) -- Kept for compatibility, but unused by v4.2 physics
 local RE_Activate = Remotes:FindFirstChild("PlaneActivate") -- optional
 local RE_Throttle = Remotes:FindFirstChild("ThrottleUpdate") -- optional
+
+-- NEW REMOTES FOR CLIENT-SIDED PHYSICS
+local RE_GearToggle = Remotes:WaitForChild("RE_GearToggle", 10)
+local RE_ThrottleSync = Remotes:WaitForChild("RE_ThrottleSync", 10)
+local RE_PlaneCrash = Remotes:WaitForChild("PlaneCrash", 10)
+if not (RE_GearToggle and RE_ThrottleSync and RE_PlaneCrash) then error("❌ Missing RE_GearToggle, RE_ThrottleSync, or PlaneCrash in PlaneRemotes") end
+
 
 -- Optional notification + data systems
 local NotificationEvents = nil
@@ -50,7 +60,7 @@ local PROMPT_DEFAULT_HOLD = 1.0 -- default if PlaneConfig omits
 -- =======================
 local REFUEL_RADIUS_STUDS      = 250        -- how close to refuel
 local REFUEL_RATE_PER_SEC      = 0.02       -- +2% per second → adds dt*rate
-local REFUEL_CHECK_INTERVAL    = 1.0        -- don’t scan too often
+local REFUEL_CHECK_INTERVAL    = 1.0        -- don't scan too often
 local REFUEL_TAG               = "RefuelStation" -- optional; uses tag if found, else name check
 -- =======================
 -- [END REFUEL ADDITION]
@@ -164,39 +174,39 @@ type PD = {
 	move: BodyVelocity,
 	gyro: BodyGyro,
 
-	accel: number,
-	maxBank: number,
-	maxSpeed: number,
-	speedVary: number,
-	stallSpeed: number,
+	-- accel: number, -- Client handles
+	-- maxBank: number, -- Client handles
+	-- maxSpeed: number, -- Client handles
+	-- speedVary: number, -- Client handles
+	-- stallSpeed: number, -- Client handles
 
-	desiredSpeed: number,
-	currentSpeed: number,
-	realSpeed: number,
+	-- desiredSpeed: number, -- Client handles
+	-- currentSpeed: number, -- Client handles
+	-- realSpeed: number, -- Client handles
 
-	throttle: number,
-	brakeThrottle: number,
+	throttle: number, -- Synced from client for fuel drain
+	-- brakeThrottle: number, -- Client handles
 	fuelRange: number,
 
 	on: boolean,
 	dead: boolean,
 	gear: boolean,
 
-	lastPos: Vector3,
-	lastTime: number,
-	lastStall: boolean,
-	isBraking: boolean,
-	landingTime: number,
-	hasBeenAirborne: boolean,
+	-- lastPos: Vector3, -- Client handles
+	-- lastTime: number, -- Client handles
+	-- lastStall: boolean, -- Client handles
+	-- isBraking: boolean, -- Client handles
+	-- landingTime: number, -- Client handles
+	-- hasBeenAirborne: boolean, -- Client handles
 	lowestPoint: number,
 
-	engineSound: Sound?,
-	windSound: Sound?,
+	-- engineSound: Sound?, -- Client handles
+	-- windSound: Sound?, -- Client handles
 
 	player: Player?,
 
 	-- v4.2
-	fallAssist: number,
+	-- fallAssist: number, -- Client handles
 
 	-- [REFUEL ADDITION]
 	lastRefuelCheck: number,
@@ -298,19 +308,9 @@ local function initPlane(model: Model): PD?
 	end
 	local lowestPoint = getLowestPoint(main, gearParts)
 
-	local function mkSound(name, id, minVol, minPitch, rolloff)
-		if not id then return nil end
-		local s = Instance.new("Sound")
-		s.Name = name
-		s.SoundId = id
-		s.RollOffMode = Enum.RollOffMode.Linear
-		s.RollOffMaxDistance = rolloff or 200
-		s.Looped = true
-		s.Volume = minVol or 0
-		s.Pitch = minPitch or 1
-		s.Parent = main
-		return s
-	end
+	-- SOUNDS REMOVED - Client will create these
+	-- local function mkSound(...)
+	-- ...
 
 	local pd: PD = {
 		plane = model, cfg = cfg, main = main, seat = seat, landingGear = landing,
@@ -318,28 +318,27 @@ local function initPlane(model: Model): PD?
 		gearParts = gearParts,
 		lowestPoint = lowestPoint,
 
-		accel = cfg.ACCELERATION,
-		maxBank = math.clamp(cfg.MAX_BANK, -90, 90),
-		maxSpeed = cfg.MAX_SPEED,
-		speedVary = cfg.SPEED_DIFFERENTIAL,
-		stallSpeed = math.min(cfg.STALL_SPEED, cfg.MAX_SPEED),
+		-- All physics values removed (client handles)
+		-- accel = cfg.ACCELERATION,
+		-- maxBank = math.clamp(cfg.MAX_BANK, -90, 90),
+		-- ...
 
-		desiredSpeed = 0, currentSpeed = 0, realSpeed = 0,
-
-		throttle = 0, brakeThrottle = 0,
+		throttle = 0, -- Only for fuel drain
 		fuelRange = model:GetAttribute("FuelRange") or 1.0,
 
 		on = false, dead = false, gear = true,
 
-		lastPos = main.Position, lastTime = tick(), lastStall = false,
-		isBraking = false, landingTime = 0, hasBeenAirborne = false,
+		-- Physics state removed (client handles)
+		-- lastPos = main.Position, lastTime = tick(), lastStall = false,
+		-- ...
 
-		engineSound = mkSound("EngineSound", cfg.ENGINE_SOUND_ID, cfg.ENGINE_MIN_VOLUME, cfg.ENGINE_MIN_PITCH, cfg.ENGINE_SOUND_ROLLOFF),
-		windSound = mkSound("WindSound", cfg.WIND_SOUND_ID, 0, cfg.WIND_MIN_PITCH, cfg.WIND_SOUND_ROLLOFF),
+		-- Sounds removed (client handles)
+		-- engineSound = mkSound(...)
+		-- windSound = mkSound(...)
 
 		player = nil,
 
-		fallAssist = 0,
+		-- fallAssist = 0, -- Client handles
 
 		-- [REFUEL ADDITION]
 		lastRefuelCheck = 0,
@@ -356,34 +355,13 @@ local function initPlane(model: Model): PD?
 end
 
 -- Helpers
-local function calculateTransition(speed, transStart, transEnd)
-	if speed <= transStart then return 0 end
-	if speed >= transEnd then return 1 end
-	if (transEnd - transStart) == 0 then return 1 end
-	return (speed - transStart) / (transEnd - transStart)
-end
-
-local function isTaxiing(pd: PD)
-	local onGround = Workspace:FindPartOnRay(Ray.new(pd.main.Position, Vector3.new(0, -pd.lowestPoint, 0)), pd.plane)
-	return onGround and pd.currentSpeed <= pd.cfg.STALL_SPEED
-end
-
-local function stall(pd: PD)
-	if pd.isBraking and pd.desiredSpeed < pd.cfg.STALL_SPEED then return false end
-	local diff = ((pd.realSpeed - pd.cfg.STALL_SPEED) / 200)
-	diff = (diff > 0.9 and 0.9 or diff)
-	local check = {
-		(pd.currentSpeed <= pd.cfg.STALL_SPEED),
-		(pd.main.CFrame.lookVector.Y > (pd.realSpeed < pd.cfg.STALL_SPEED and -1 or diff))
-	}
-	for _, c in ipairs(check) do if not c then return false end end
-	return true
-end
+-- [Client-side physics helpers removed - calculateTransition, isTaxiing, stall]
 
 -- Activation
 local function setForceCaps(pd: PD, on: boolean)
 	local cap = pd.cfg.MAX_SAFE_FORCE
 	if on then
+		-- Set high caps, client will control the actual force/velocity
 		pd.move.MaxForce = Vector3.new(cap, cap, cap)
 		pd.gyro.MaxTorque = Vector3.new(cap, cap, cap)
 	else
@@ -403,8 +381,9 @@ local function activate(pd: PD, plr: Player)
 
 	setForceCaps(pd, true)
 
-	if pd.engineSound then pd.engineSound:Play() end
-	if pd.windSound then pd.windSound:Play() end
+	-- Sounds removed (client handles)
+	-- if pd.engineSound then pd.engineSound:Play() end
+	-- if pd.windSound then pd.windSound:Play() end
 	if RE_Activate then pcall(function() RE_Activate:FireClient(plr, pd.plane, true) end) end
 end
 
@@ -415,9 +394,8 @@ local function deactivate(pd: PD)
 		if registry[pd.plane] ~= pd then return end
 		local f = (i/5)*0.2
 		pd.move.MaxForce = Vector3.new(cap, cap, cap) * f
-		if not isTaxiing(pd) then
-			pd.gyro.MaxTorque = Vector3.new(cap, cap, cap) * f
-		end
+		-- [Modified] Removed check for isTaxiing since server doesn't know
+		pd.gyro.MaxTorque = Vector3.new(cap, cap, cap) * f
 		task.wait(0.05)
 	end
 	setForceCaps(pd, false)
@@ -425,11 +403,13 @@ local function deactivate(pd: PD)
 	pd.gyro.CFrame = pd.main.CFrame
 	pcall(function() pd.main:SetNetworkOwnershipAuto() end)
 
-	if pd.engineSound then pd.engineSound:Stop() end
-	if pd.windSound then pd.windSound:Stop() end
+	-- Sounds removed (client handles)
+	-- if pd.engineSound then pd.engineSound:Stop() end
+	-- if pd.windSound then pd.windSound:Stop() end
 	if RE_Activate and pd.player then pcall(function() RE_Activate:FireClient(pd.player, pd.plane, false) end) end
 	pd.on = false
 	pd.player = nil
+	pd.throttle = 0 -- Stop fuel drain
 	pd.plane:SetAttribute("CurrentThrottle", 0)
 end
 
@@ -476,7 +456,7 @@ end
 -- pd.currentRefuelStation : BasePart|nil
 local function stepRefuel(pd: PD, now: number)
 	if not pd or not pd.main or not pd.plane then return end
-	
+
 	-- Initialize lastRefuelCheck if it's 0
 	if pd.lastRefuelCheck == 0 then
 		pd.lastRefuelCheck = now
@@ -504,7 +484,7 @@ local function stepRefuel(pd: PD, now: number)
 	local add = REFUEL_RATE_PER_SEC * dt
 	local newFuel = math.clamp(currentFuel + add, 0, 1)
 	pd.plane:SetAttribute("FuelRange", newFuel)
-	
+
 	pd.currentRefuelStation = station
 end
 -- =======================
@@ -565,273 +545,17 @@ local function warpAndSit(player: Player, pd: PD): boolean
 end
 
 -- =======================
--- [PHYSICS UPDATE V4.2]
+-- [PHYSICS UPDATE V4.2 - REMOVED]
 -- =======================
-local function update(pd: PD, input)
-	if not pd.on or not pd.player then return end
-	if not (input and input.viewSizeX and input.mouseX and input.mouseHit and input.mouseHitP) then return end
-
-	local cfg = pd.cfg
-
-	-- Direct delta time and speed calculation
-	local now = tick()
-	local dt = now - pd.lastTime
-	if dt <= 0 then return end
-
-	local dist = (pd.lastPos - pd.main.Position).Magnitude
-	pd.realSpeed = (dist / dt) -- direct, no smoothing
-
-	pd.lastPos = pd.main.Position
-	pd.lastTime = now
-
-	-- SAFETY: Void prevention
-	if pd.main.Position.Y < cfg.VOID_THRESHOLD then
-		pd.main.CFrame = CFrame.new(pd.main.Position.X, 50, pd.main.Position.Z)
-		pd.main.AssemblyLinearVelocity = Vector3.new(0, -10, 0)
-		print("⚠️ VOID PREVENTION - Teleported to safety!")
-	end
-
-	-- Transition factor
-	local transitionFactor = calculateTransition(pd.currentSpeed, cfg.TRANSITION_START, cfg.TRANSITION_END)
-
-	-- Fuel
-	local extFuel = pd.plane:GetAttribute("FuelRange")
-	if extFuel ~= nil then pd.fuelRange = extFuel end
-	if pd.fuelRange > 0 and dt > 0 then
-		local useNow = pd.throttle * cfg.FUEL_CONSUMPTION_RATE * dt
-		pd.fuelRange = math.max(0, pd.fuelRange - useNow)
-		pd.plane:SetAttribute("FuelRange", pd.fuelRange)
-		if pd.fuelRange <= 0 then
-			pd.throttle = 0
-			pd.desiredSpeed = 0
-		end
-	end
-
-	-- Throttle/brake
-	if input.throttleUp then
-		if pd.brakeThrottle > 0 then
-			pd.brakeThrottle = math.max(0, pd.brakeThrottle - cfg.BRAKE_RELEASE_RATE)
-		else
-			if pd.fuelRange > 0 then
-				pd.throttle = math.min(1, pd.throttle + cfg.THROTTLE_INCREASE_RATE)
-			end
-		end
-		pd.isBraking = false
-	elseif input.throttleDown then
-		if pd.throttle > 0 then
-			pd.throttle = math.max(0, pd.throttle - cfg.THROTTLE_INCREASE_RATE)
-		else
-			pd.brakeThrottle = math.min(1, pd.brakeThrottle + cfg.BRAKE_INCREASE_RATE)
-		end
-		pd.isBraking = true
-	else
-		pd.throttle = math.max(0, pd.throttle - cfg.THROTTLE_DECAY_RATE)
-		pd.brakeThrottle = math.max(0, pd.brakeThrottle - cfg.BRAKE_RELEASE_RATE)
-		pd.isBraking = false
-	end
-
-	-- Sounds
-	if pd.engineSound then
-		local t = pd.throttle
-		pd.engineSound.Volume = cfg.ENGINE_MIN_VOLUME + (cfg.ENGINE_MAX_VOLUME - cfg.ENGINE_MIN_VOLUME) * t
-		pd.engineSound.Pitch = cfg.ENGINE_MIN_PITCH + (cfg.ENGINE_MAX_PITCH - cfg.ENGINE_MIN_PITCH ) * t
-	end
-	if pd.windSound then
-		local sPct = math.clamp((pd.realSpeed - cfg.WIND_START_SPEED) / (pd.maxSpeed - cfg.WIND_START_SPEED), 0, 1)
-		pd.windSound.Volume = cfg.WIND_MIN_VOLUME + (cfg.WIND_MAX_VOLUME - cfg.WIND_MIN_VOLUME) * sPct
-		pd.windSound.Pitch = cfg.WIND_MIN_PITCH + (cfg.WIND_MAX_PITCH - cfg.WIND_MIN_PITCH ) * sPct
-	end
-
-	if RE_Throttle and pd.player then
-		-- [REFUEL ADDITION] Pass fuelRange
-		pcall(function() RE_Throttle:FireClient(pd.player, pd.throttle, pd.brakeThrottle, pd.fuelRange) end)
-	end
-	pd.plane:SetAttribute("CurrentThrottle", pd.throttle)
-
-	-- Gear toggle (uses tagged gear parts)
-	if input.landing then
-		pd.gear = not pd.gear
-		for _,v in ipairs(pd.gearParts or {}) do
-			local t = v:FindFirstChild("Trans")
-			local r = v:FindFirstChild("Ref")
-			local c = v:FindFirstChild("Collide")
-			if t and r and c then
-				v.Transparency = (pd.gear and t.Value or 1)
-				v.Reflectance = (pd.gear and r.Value or 0)
-				v.CanCollide = (pd.gear and c.Value or false)
-			end
-		end
-	end
-
-	-- Health/throttle multiplier
-	pd.throttle = pd.throttle * (pd.plane:GetAttribute("ThrottleMultiplier") or 1.0)
-
-	-- Speed model
-	local vary = -pd.main.CFrame.LookVector.Y * (pd.speedVary or 0)
-	local vmax = math.max(1, (pd.maxSpeed or 200) + vary)
-	local forward = vmax * pd.throttle
-	local brake = vmax * pd.brakeThrottle * cfg.BRAKE_FORCE_MULTIPLIER
-	pd.desiredSpeed = forward + brake
-
-	local change = (pd.desiredSpeed > pd.currentSpeed) and 1 or -1
-	local ns = pd.currentSpeed + (pd.accel or 1) * change
-	if change == 1 then
-		pd.currentSpeed = math.min(ns, pd.desiredSpeed)
-	else
-		pd.currentSpeed = math.max(ns, math.max(pd.desiredSpeed, -20))
-	end
-
-	local stl = stall(pd)
-
-	if pd.lastStall and not stl and not isTaxiing(pd) then
-		if not pd.isBraking and pd.realSpeed > 10 and pd.realSpeed < pd.maxSpeed then
-			local sd = pd.realSpeed - pd.currentSpeed
-			pd.currentSpeed = pd.currentSpeed + (sd * 0.1)
-		end
-	end
-	pd.lastStall = stl
-
-	local onGround = Workspace:FindPartOnRay(Ray.new(pd.main.Position, Vector3.new(0, -pd.lowestPoint, 0)), pd.plane)
-
-	if not onGround and pd.realSpeed > cfg.LANDING_MIN_AIR_SPEED then
-		pd.hasBeenAirborne = true
-	end
-	if onGround and pd.hasBeenAirborne and pd.realSpeed > cfg.LANDING_DETECTION_SPEED and pd.landingTime == 0 then
-		pd.landingTime = now
-		pd.hasBeenAirborne = false
-		local cap = cfg.MAX_SAFE_FORCE * 0.3
-		pd.move.MaxForce = Vector3.new(cap, cap, cap)
-	end
-
-	local inGrace = false
-	if pd.landingTime > 0 then
-		if (now - pd.landingTime) < cfg.LANDING_GRACE_TIME then
-			inGrace = true
-		else
-			pd.landingTime = 0
-		end
-	end
-
-	-- Base velocity (forward along look vector)
-	local baseVelocity = pd.main.CFrame.LookVector * pd.currentSpeed
-
-	-- Stall downward clamp
-	if stl and not onGround then
-		if baseVelocity.Y < -80 then
-			baseVelocity = Vector3.new(baseVelocity.X, -80, baseVelocity.Z)
-		end
-	end
-
-	-- Orientation targets and authority
-	local rawBank = (((input.viewSizeX/2) - input.mouseX) / math.max(1, (input.viewSizeX/2))) * pd.maxBank
-	local bank = math.clamp(rawBank, -pd.maxBank, pd.maxBank)
-	local groundCFrame = CFrame.new(pd.main.Position, input.mouseHitP)
-	local flightCFrame = input.mouseHit * CFrame.Angles(0, 0, math.rad(bank))
-	local targetCFrame = groundCFrame:Lerp(flightCFrame, transitionFactor)
-
-	-- ===== v4.2 RECOVERY ASSIST =====
-	local targetLookY = targetCFrame.LookVector.Y
-	local noseUpIntent = math.clamp((-targetLookY - 0.02) / 0.6, 0, 1)
-	local throttleIntent = math.clamp((pd.throttle - 0.5) / 0.5, 0, 1)
-	local speedOK = (pd.currentSpeed >= (pd.cfg.STALL_SPEED * 0.85)) and 1 or 0
-	local recoveryIntent = math.clamp(0.65 * noseUpIntent + 0.35 * throttleIntent, 0, 1) * speedOK
-
-	local riseTau, decayTau = 0.20, 0.45
-	local k = dt / ((recoveryIntent > pd.fallAssist) and riseTau or decayTau)
-	k = math.clamp(k, 0, 1)
-	pd.fallAssist = pd.fallAssist + (recoveryIntent - pd.fallAssist) * k
-	-- ================================
-
-	-- Fall term
-	local fallSpeed = (1 - transitionFactor) * cfg.MAX_FALL_SPEED
-
-	-- Reduce fall by recovery assist (up to ~90%)
-	local effectiveFall = fallSpeed * (1 - 0.9 * pd.fallAssist)
-
-	-- Prevent extreme combined downward velocity
-	local totalDown = baseVelocity.Y - effectiveFall
-	if totalDown < -150 then
-		effectiveFall = effectiveFall * 0.5
-	end
-
-	-- Hard clamp forward magnitude before applying fall
-	if baseVelocity.Magnitude > cfg.MAX_VELOCITY then
-		baseVelocity = baseVelocity.Unit * cfg.MAX_VELOCITY
-	end
-
-	-- Gyro torque setup with sensitivities
-	local F = cfg.MAX_SAFE_FORCE
-	local pitchSensitivity = cfg.PITCH_SENSITIVITY or 1.0
-	local bankSensitivity = cfg.BANK_SENSITIVITY or 1.0
-	local targetPitchTorque = F * transitionFactor * pitchSensitivity
-	local targetBankTorque = F * bankSensitivity
-
-	-- ===== v4.2: terminal fall speed =====
-	local TERMINAL_FALL_SPEED = cfg.TERMINAL_FALL_SPEED or 160
-	-- ==========================================================
-
-	if onGround then
-		pd.move.Velocity = baseVelocity -- no falling while grounded
-
-		if pd.currentSpeed < 2 then
-			pd.move.MaxForce = Vector3.new(0, 0, 0)
-			pd.gyro.MaxTorque = Vector3.new(0, 0, 0)
-			pd.gyro.CFrame = groundCFrame
-		elseif inGrace then
-			pd.move.MaxForce = Vector3.new(F*0.1, F*0.05, F*0.1)
-			pd.gyro.MaxTorque = Vector3.new(0, F*0.1, 0)
-			pd.gyro.CFrame = groundCFrame
-		else
-			local forceMult = stl and 0.3 or 1.0
-			local yAxisForce = F * transitionFactor * forceMult
-			-- small Y-lift boost during recovery
-			yAxisForce = yAxisForce * (1 + 0.25 * pd.fallAssist)
-
-			pd.move.MaxForce = Vector3.new(F, yAxisForce, F)
-			pd.gyro.MaxTorque = Vector3.new(targetPitchTorque, F, targetBankTorque)
-			pd.gyro.CFrame = targetCFrame
-		end
-	else
-		-- In the air: apply forward + reduced fall
-		local vy = baseVelocity.Y - effectiveFall
-		if vy < -TERMINAL_FALL_SPEED then
-			vy = -TERMINAL_FALL_SPEED -- v4.2: cap commanded downward speed
-		end
-		pd.move.Velocity = Vector3.new(baseVelocity.X, vy, baseVelocity.Z)
-
-		local forceMult = stl and 0.3 or 1.0
-		local yAxisForce = F * transitionFactor * forceMult
-		-- boost Y-lift under recovery assist (max +35%)
-		yAxisForce = yAxisForce * (1 + 0.35 * pd.fallAssist)
-
-		pd.move.MaxForce = Vector3.new(F * forceMult, yAxisForce, F * forceMult)
-		pd.gyro.MaxTorque = Vector3.new(targetPitchTorque, F, targetBankTorque)
-		pd.gyro.CFrame = targetCFrame
-
-		-- Final downward clamp while airborne (safety)
-		local v = pd.main.AssemblyLinearVelocity
-		if v.Y < -TERMINAL_FALL_SPEED then
-			pd.main.AssemblyLinearVelocity = Vector3.new(v.X, -TERMINAL_FALL_SPEED, v.Z)
-		end
-	end
-
-	-- Hard velocity clamp (overall magnitude)
-	local vel = pd.main.AssemblyLinearVelocity
-	if vel.Magnitude > cfg.MAX_VELOCITY then
-		pd.main.AssemblyLinearVelocity = vel.Unit * (cfg.MAX_VELOCITY * 0.8)
-	end
-end
+-- The 'update(pd, input)' function has been moved to ClientPlaneInput.lua
+-- The server no longer runs physics calculations.
 
 -- =======================
--- [BOOTSTRAP - UNTOUCHED]
+-- [BOOTSTRAP - MODIFIED]
 -- =======================
 
--- Remotes
-RE_Input.OnServerEvent:Connect(function(plr, planeModel, input)
-	local pd = registry[planeModel]
-	if not pd or pd.player ~= plr then return end
-	update(pd, input)
-end)
+-- REMOVED: RE_Input.OnServerEvent
+-- The client now runs physics locally.
 
 if RE_Activate then
 	RE_Activate.OnServerEvent:Connect(function(plr, planeModel, active)
@@ -840,6 +564,101 @@ if RE_Activate then
 		if active then activate(pd, plr) else deactivate(pd) end
 	end)
 end
+
+-- NEW: Listen for client gear toggle
+RE_GearToggle.OnServerEvent:Connect(function(plr, planeModel)
+	local pd = registry[planeModel]
+	if not pd or pd.player ~= plr then return end
+
+	-- This logic is copied from the old 'update' function
+	-- to replicate gear state to all clients.
+	pd.gear = not pd.gear
+	for _,v in ipairs(pd.gearParts or {}) do
+		local t = v:FindFirstChild("Trans")
+		local r = v:FindFirstChild("Ref")
+		local c = v:FindFirstChild("Collide")
+		if t and r and c then
+			v.Transparency = (pd.gear and t.Value or 1)
+			v.Reflectance = (pd.gear and r.Value or 0)
+			v.CanCollide = (pd.gear and c.Value or false)
+		end
+	end
+end)
+
+-- NEW: Listen for client throttle sync (for fuel drain)
+RE_ThrottleSync.OnServerEvent:Connect(function(plr, planeModel, throttleValue)
+	local pd = registry[planeModel]
+	if not pd or pd.player ~= plr then return end
+
+	-- Only store the throttle. The Heartbeat loop will handle consumption.
+	pd.throttle = (throttleValue or 0)
+	pd.plane:SetAttribute("CurrentThrottle", pd.throttle)
+end)
+
+-- ========================================================
+-- [NEW] CRASH DETECTION HANDLER
+-- ========================================================
+RE_PlaneCrash.OnServerEvent:Connect(function(plr, planeModel)
+	print("💥 Server received crash event from: " .. plr.Name)
+
+	if not planeModel or not planeModel:IsA("Model") then
+		warn("❌ Invalid plane model received")
+		return
+	end
+
+	local pd = registry[planeModel]
+	if not pd then
+		warn("❌ Plane not found in registry: " .. planeModel.Name)
+		return
+	end
+
+	if pd.player ~= plr then
+		warn("❌ Player mismatch - expected: " .. (pd.player and pd.player.Name or "nil") .. ", got: " .. plr.Name)
+		return
+	end
+
+	print("💥 Server handling crash for: " .. pd.plane.Name)
+
+	-- Force deactivate physics
+	if pd.on then
+		deactivate(pd)
+	end
+
+	-- Create explosion at plane position
+	local explosion = Instance.new("Explosion")
+	explosion.Position = pd.main.Position
+	explosion.BlastRadius = 50
+	explosion.BlastPressure = 500000
+	explosion.Parent = workspace
+	print("💥 Explosion created at: " .. tostring(pd.main.Position))
+
+	-- Kill the player
+	local char = plr.Character
+	if char then
+		local humanoid = char:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.Health = 0
+			print("💀 Player killed in crash: " .. plr.Name)
+		else
+			warn("❌ No humanoid found for: " .. plr.Name)
+		end
+	else
+		warn("❌ No character found for: " .. plr.Name)
+	end
+
+	-- Clean up plane after 5 seconds
+	task.delay(5, function()
+		if pd.plane and pd.plane.Parent then
+			print("🧹 Cleaning up crashed plane: " .. pd.plane.Name)
+			registry[pd.plane] = nil
+			pd.plane:Destroy()
+		end
+	end)
+end)
+-- ========================================================
+-- [END CRASH DETECTION HANDLER]
+-- ========================================================
+
 
 -- Prompt + seat
 local function bindPrompt(pd: PD)
@@ -925,16 +744,38 @@ Workspace.DescendantAdded:Connect(function(d)
 end)
 
 -- =======================
--- [REFUEL ADDITION - PASSIVE LOOP]
+-- [REFUEL + FUEL DRAIN - PASSIVE LOOP]
 -- =======================
--- This loop runs passively to check for refueling,
--- separate from the physics 'update' loop.
-RunService.Heartbeat:Connect(function()
+-- This loop runs passively to check for refueling AND fuel drain
+RunService.Heartbeat:Connect(function(dt)
 	local now = tick()
 	for _, pd in pairs(registry) do
 		-- Check if plane exists and is in the workspace
 		if pd.plane and pd.plane.Parent then
+
+			-- [REFUEL ADDITION]
 			stepRefuel(pd, now)
+
+			-- [NEW] FUEL DRAIN (copied from old update function)
+			if pd.on and pd.player then
+				local extFuel = pd.plane:GetAttribute("FuelRange")
+				if extFuel ~= nil then pd.fuelRange = extFuel end
+
+				if pd.throttle > 0 and pd.fuelRange > 0 and dt > 0 then
+					local useNow = pd.throttle * pd.cfg.FUEL_CONSUMPTION_RATE * dt
+					pd.fuelRange = math.max(0, pd.fuelRange - useNow)
+					pd.plane:SetAttribute("FuelRange", pd.fuelRange)
+					if pd.fuelRange <= 0 then
+						pd.throttle = 0 -- Stop drain
+					end
+				end
+
+				-- [FIXED] Always send fuel status to client GUI when player is active
+				if RE_Throttle and pd.player then
+					-- Client doesn't send brake status, so we pass 0
+					pcall(function() RE_Throttle:FireClient(pd.player, pd.throttle, 0, pd.fuelRange) end)
+				end
+			end
 		end
 	end
 end)
@@ -942,4 +783,4 @@ end)
 -- [END REFUEL ADDITION]
 -- =======================
 
-print("✅ UnifiedPlanePhysics v4.2 loaded (Realistic Takeoff + Recovery Assist + Refuel Module)")
+print("✅ UnifiedPlanePhysics v4.2 LOADED (SERVER - Client Physics)")
