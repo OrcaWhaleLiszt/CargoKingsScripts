@@ -605,13 +605,35 @@ function ShoulderCamera:onRenderStep(dt)
 		-- MODIFIED: If not zoomed AND ON DESKTOP, calculate yaw/pitch from mouse hit and rotate waist
 		if not self.isMobile and not self.zoomState and self.lastMouseHitPosition then
 			local rootPos = self.currentRootPart.Position
-			local shoulderPos = rootPos + Vector3.new(0, 1.5, 0) -- Approximate shoulder height
+			local shoulderPos = rootPos + Vector3.new(0, 1.5, 0)
 			local directionToMouse = (self.lastMouseHitPosition - shoulderPos)
-			targetYaw = math.atan2(-directionToMouse.X, -directionToMouse.Z)
-			targetPitch = math.asin(directionToMouse.Unit.Y)
+			local mouseYaw = math.atan2(-directionToMouse.X, -directionToMouse.Z)
+			local mousePitch = math.asin(directionToMouse.Unit.Y)
 
-			-- In non-zoomed state, rotate torso independently via Waist joint
-			self.currentHumanoid.AutoRotate = true  -- Let legs follow movement direction
+			self.currentHumanoid.AutoRotate = true  -- Legs follow WASD
+
+			if self.currentWaist and self.originalWaistC0 then
+				-- CORRECTED: Calculate waist rotation relative to the root part's actual rotation
+				local clampedMousePitch = math.clamp(mousePitch, -math.rad(60), math.rad(60))
+
+				-- Get the root part's rotation CFrame (no position)
+				local rootRotation = self.currentRootPart.CFrame - self.currentRootPart.CFrame.Position
+
+				-- Get the target world rotation
+				local worldRotation = CFrame.Angles(0, mouseYaw, 0)
+
+				-- Find the relative rotation needed to get from root to world
+				local relativeRotation = rootRotation:ToObjectSpace(worldRotation)
+
+				-- Get the yaw angle from that relative rotation
+				local _, relativeYaw, _ = relativeRotation:ToOrientation()
+
+				-- Clamp relative rotation
+				relativeYaw = math.clamp(relativeYaw, -math.rad(90), math.rad(90))
+
+				local targetC0 = self.originalWaistC0 * CFrame.Angles(clampedMousePitch, relativeYaw, 0)
+				self.currentWaist.C0 = self.currentWaist.C0:Lerp(targetC0, 0.3)
+			end
 
 			if self.currentWaist and self.originalWaistC0 then
 				-- FIXED: Simple approach - calculate aim direction relative to root part
@@ -644,9 +666,10 @@ function ShoulderCamera:onRenderStep(dt)
 			if self.currentWaist and self.originalWaistC0 then
 				self.currentWaist.C0 = self.currentWaist.C0:Lerp(self.originalWaistC0, 0.3)
 			end
-		end
 
-		self:applyRootJointFix()
+			self:applyRootJointFix()
+		end
+		-- Rotating torso issue fixed above here
 	else
 		self.currentHumanoid.AutoRotate = true
 
