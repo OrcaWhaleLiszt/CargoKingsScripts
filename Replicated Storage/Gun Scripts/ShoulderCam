@@ -1,3 +1,10 @@
+-- OrcaCreations--
+-- Version 2.1: Fixed sprint system - ShoulderCamera only controls speed when aiming
+-- Date: January 20, 2025
+-- Placement: ReplicatedStorage > WeaponsSystem > ShoulderCamera (ModuleScript)
+-- Context: Third-person camera system that ONLY overrides walk speed when zoomed/aiming
+--          All other times, ModernSprintScript handles sprinting
+
 local ContextActionService = game:GetService("ContextActionService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -19,7 +26,6 @@ local GameSettings = Settings.GameSettings
 
 local CAMERA_RENDERSTEP_NAME = "ShoulderCameraUpdate"
 local ZOOM_ACTION_NAME = "ShoulderCameraZoom"
-local SPRINT_ACTION_NAME = "ShoulderCameraSprint"
 local CONTROLLABLE_HUMANOID_STATES = {
 	[Enum.HumanoidStateType.Running] = true,
 	[Enum.HumanoidStateType.RunningNoPhysics] = true,
@@ -134,7 +140,6 @@ function ShoulderCamera.new(weaponsSystem)
 	self.defaultZoomFactor = 1
 	self.canZoom = true
 	self.zoomInputs = { Enum.UserInputType.MouseButton2, Enum.KeyCode.ButtonL2 }
-	self.sprintInputs = { Enum.KeyCode.LeftShift }
 	self.mouseRadsPerPixel = Vector2.new(1 / 400, 1 / 400)
 	self.zoomedMouseRadsPerPixel = Vector2.new(1 / 600, 1 / 600)
 	self.touchSensitivity = Vector2.new(1 / 100, 1 / 100)
@@ -144,10 +149,9 @@ function ShoulderCamera.new(weaponsSystem)
 	self.recoilDecay = 2 -- higher number means faster recoil decay rate
 	self.rotateCharacterWithCamera = true
 	self.gamepadSensitivityModifier = Vector2.new(0.85, 0.65)
-	-- Walk speeds
-	self.zoomWalkSpeed = 8
-	self.normalWalkSpeed = 16
-	self.sprintingWalkSpeed = 24
+	
+	-- Walk speeds (ONLY used when aiming)
+	self.zoomWalkSpeed = 8  -- Speed when aiming
 
 	-- Current state
 	self.enabled = false
@@ -161,11 +165,10 @@ function ShoulderCamera.new(weaponsSystem)
 	self.mouseLocked = false 
 	self.touchPanAccumulator = Vector2.new(0, 0) -- used for touch devices, represents amount the player has dragged their finger since starting a touch
 	self.currentTool = nil
-	self.sprintingInputActivated = false
-	self.desiredWalkSpeed = self.normalWalkSpeed
-	self.sprintEnabled = false -- true means player will move faster while doing sprint inputs
-	self.slowZoomWalkEnabled = false -- true means player will move slower while doing zoom inputs
+	self.desiredWalkSpeed = 16  -- Only used when aiming
+	self.slowZoomWalkEnabled = true -- Controls walk speed ONLY when zoomed
 	self.desiredFieldOfView = self.fieldOfView
+	
 	-- Zoom variables
 	self.zoomedFromInput = false -- true if player has performed input to zoom
 	self.forcedZoomed = false -- ignores zoomedFromInput and canZoom
@@ -175,6 +178,7 @@ function ShoulderCamera.new(weaponsSystem)
 	self.hideToolWhileZoomed = false
 	self.currentZoomFactor = self.defaultZoomFactor
 	self.zoomedFOV = self.fieldOfView
+	
 	-- Gamepad variables
 	self.gamepadPan = Vector2.new(0, 0) -- essentially the amount the gamepad has moved from resting position
 	self.movementPan = Vector2.new(0, 0) -- this is for movement (gamepadPan is for camera)
@@ -213,10 +217,10 @@ function ShoulderCamera.new(weaponsSystem)
 	self.controlModule = nil -- used to get player's touch input for moving character
 	self.random = Random.new()
 
-	-- NEW: Detect mobile for platform-specific logic
+	-- Detect mobile for platform-specific logic
 	self.isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and not UserInputService.MouseEnabled
 
-	-- NEW: Mouse raycasting for aiming at cursor
+	-- Mouse raycasting for aiming at cursor
 	self.lastMouseHitPosition = nil
 
 	return self
@@ -234,7 +238,6 @@ function ShoulderCamera:setEnabled(enabled)
 
 		RunService:BindToRenderStep(CAMERA_RENDERSTEP_NAME, Enum.RenderPriority.Camera.Value - 1, function(dt) self:onRenderStep(dt) end)
 		ContextActionService:BindAction(ZOOM_ACTION_NAME, function(...) self:onZoomAction(...) end, false, unpack(self.zoomInputs))
-		ContextActionService:BindAction(SPRINT_ACTION_NAME, function(...) self:onSprintAction(...) end, false, unpack(self.sprintInputs))
 
 		table.insert(self.eventConnections, LocalPlayer.CharacterAdded:Connect(function(character) self:onCurrentCharacterChanged(character) end))
 		table.insert(self.eventConnections, LocalPlayer.CharacterRemoving:Connect(function() self:onCurrentCharacterChanged(nil) end))
@@ -269,7 +272,7 @@ function ShoulderCamera:setEnabled(enabled)
 		end)
 
 		self.weaponsSystem.aimRayCallback = function()
-			-- MODIFIED: On mobile, always use camera direction. On Desktop, use hip-fire logic.
+			-- On mobile, always use camera direction. On Desktop, use hip-fire logic.
 			if not self.isMobile and not self.zoomState and self.lastMouseHitPosition then
 				local shoulderPos = self.currentRootPart.Position + Vector3.new(0, 1.5, 0)
 				local direction = (self.lastMouseHitPosition - shoulderPos).Unit
@@ -280,7 +283,7 @@ function ShoulderCamera:setEnabled(enabled)
 			end
 		end
 
-		-- NEW: Create smooth transition by lerping camera over time
+		-- Create smooth transition by lerping camera over time
 		self.transitionAlpha = 0
 		self.transitionStartCFrame = startCameraCFrame
 		self.isTransitioning = true
@@ -290,13 +293,12 @@ function ShoulderCamera:setEnabled(enabled)
 
 		RunService:UnbindFromRenderStep(CAMERA_RENDERSTEP_NAME)
 		ContextActionService:UnbindAction(ZOOM_ACTION_NAME)
-		ContextActionService:UnbindAction(SPRINT_ACTION_NAME)
 
 		if self.currentHumanoid then
 			self.currentHumanoid.AutoRotate = true
 		end
 
-		-- IMPORTANT: Reset waist to original position when disabling
+		-- Reset waist to original position when disabling
 		if self.currentWaist and self.originalWaistC0 then
 			self.currentWaist.C0 = self.originalWaistC0
 		end
@@ -321,7 +323,7 @@ function ShoulderCamera:setEnabled(enabled)
 	end
 end
 
--- NEW: Function to get world position from mouse
+-- Function to get world position from mouse
 function ShoulderCamera:getMouseHitPosition()
 	if not self.currentCamera then
 		return nil
@@ -352,7 +354,7 @@ function ShoulderCamera:onRenderStep(dt)
 		return
 	end
 
-	-- NEW: Handle smooth transition when equipping
+	-- Handle smooth transition when equipping
 	if self.isTransitioning then
 		self.transitionAlpha = math.min(self.transitionAlpha + dt / 0.8, 1) -- 0.8 second transition
 
@@ -361,13 +363,12 @@ function ShoulderCamera:onRenderStep(dt)
 		end
 	end
 
-	-- MODIFIED: Mouse lock logic (desktop = lock only when zoomed; mobile = always lock)
+	-- Mouse lock logic (desktop = lock only when zoomed; mobile = always lock)
 	if self.isMobile then
 		self.mouseLocked = true
 	else
 		self.mouseLocked = self.zoomState
 	end
-
 
 	-- Hide mouse and lock to center if applicable
 	if self.mouseLocked and not GuiService:GetEmotesMenuOpen() then
@@ -378,11 +379,11 @@ function ShoulderCamera:onRenderStep(dt)
 		UserInputService.MouseIconEnabled = true
 	end
 
-	-- MODIFIED: Desktop-only hip-fire logic (mouse-position aiming and edge-panning)
+	-- Desktop-only hip-fire logic (mouse-position aiming and edge-panning)
 	if not self.isMobile and not self.zoomState then
 		self.lastMouseHitPosition = self:getMouseHitPosition()
 
-		-- NEW: Edge-pan camera rotation in State 2
+		-- Edge-pan camera rotation in hip-fire mode
 		local mousePos = UserInputService:GetMouseLocation()
 		local viewportSize = self.currentCamera.ViewportSize
 
@@ -396,27 +397,23 @@ function ShoulderCamera:onRenderStep(dt)
 		local topEdgeZone = 0.25
 		local bottomEdgeZone = 0.75
 
-		local edgePanYawSpeed = 0  -- Horizontal rotation
-		local edgePanPitchSpeed = 0  -- Vertical rotation
+		local edgePanYawSpeed = 0
+		local edgePanPitchSpeed = 0
 
 		-- Horizontal edge panning
 		if mouseXPercent < leftEdgeZone then
-			-- Mouse is in left edge zone - rotate camera left
 			local intensity = 1.0 - (mouseXPercent / leftEdgeZone)
 			edgePanYawSpeed = intensity * 0.05
 		elseif mouseXPercent > rightEdgeZone then
-			-- Mouse is in right edge zone - rotate camera right
 			local intensity = (mouseXPercent - rightEdgeZone) / (1.0 - rightEdgeZone)
 			edgePanYawSpeed = -intensity * 0.05
 		end
 
 		-- Vertical edge panning
 		if mouseYPercent < topEdgeZone then
-			-- Mouse is in top edge zone - rotate camera up
 			local intensity = 1.0 - (mouseYPercent / topEdgeZone)
 			edgePanPitchSpeed = intensity * 0.05
 		elseif mouseYPercent > bottomEdgeZone then
-			-- Mouse is in bottom edge zone - rotate camera down
 			local intensity = (mouseYPercent - bottomEdgeZone) / (1.0 - bottomEdgeZone)
 			edgePanPitchSpeed = -intensity * 0.05
 		end
@@ -429,7 +426,6 @@ function ShoulderCamera:onRenderStep(dt)
 			self.pitch = math.clamp(self.pitch + edgePanPitchSpeed, self.minPitch, self.maxPitch)
 		end
 	elseif self.isMobile then
-		-- On mobile, clear the hit position so we don't use it for desktop-style aiming
 		self.lastMouseHitPosition = nil
 	end
 
@@ -445,16 +441,10 @@ function ShoulderCamera:onRenderStep(dt)
 		ShoulderCamera.SpringService:Target(self.currentCamera, 0.8, 3, { FieldOfView = self.desiredFieldOfView })
 	end
 
-	-- Handle walk speed changes
-	if self.sprintEnabled or self.slowZoomWalkEnabled then
-		self.desiredWalkSpeed = self.normalWalkSpeed
-		if self.sprintEnabled and (self.sprintingInputActivated or self:sprintFromTouchInput() or self:sprintFromGamepadInput()) and not self.zoomState then
-			self.desiredWalkSpeed = self.sprintingWalkSpeed
-		end
-		if self.slowZoomWalkEnabled and self.zoomAlpha > 0.1 then
-			self.desiredWalkSpeed = self.zoomWalkSpeed
-		end
-
+	-- MODIFIED: Handle walk speed ONLY when zoomed (aiming)
+	-- When not zoomed, ModernSprintScript controls the speed
+	if self.slowZoomWalkEnabled and self.zoomAlpha > 0.1 then
+		self.desiredWalkSpeed = self.zoomWalkSpeed
 		ShoulderCamera.SpringService:Target(self.currentHumanoid, 0.95, 4, { WalkSpeed = self.desiredWalkSpeed })
 	end
 
@@ -587,7 +577,7 @@ function ShoulderCamera:onRenderStep(dt)
 	local currentOffsetDir = self.currentCFrame.LookVector.Unit
 	self.currentCFrame = self.currentCFrame + (currentOffsetDir * self.lastOcclusionDistance)
 
-	-- NEW: Apply smooth transition lerp when equipping
+	-- Apply smooth transition lerp when equipping
 	if self.isTransitioning and self.transitionStartCFrame then
 		self.currentCFrame = self.transitionStartCFrame:Lerp(self.currentCFrame, self.transitionAlpha)
 	end
@@ -597,12 +587,12 @@ function ShoulderCamera:onRenderStep(dt)
 	-- Apply recoil decay
 	self.currentRecoil = self.currentRecoil - (self.currentRecoil * self.recoilDecay * dt)
 
-	-- MODIFIED: Character rotation logic
+	-- Character rotation logic
 	if self:isHumanoidControllable() and self.rotateCharacterWithCamera then
 		local targetYaw = self.yaw
 		local targetPitch = self.pitch
 
-		-- MODIFIED: If not zoomed AND ON DESKTOP, calculate yaw/pitch from mouse hit and rotate waist
+		-- If not zoomed AND ON DESKTOP, calculate yaw/pitch from mouse hit and rotate waist
 		if not self.isMobile and not self.zoomState and self.lastMouseHitPosition then
 			local rootPos = self.currentRootPart.Position
 			local shoulderPos = rootPos + Vector3.new(0, 1.5, 0)
@@ -613,7 +603,7 @@ function ShoulderCamera:onRenderStep(dt)
 			self.currentHumanoid.AutoRotate = true  -- Legs follow WASD
 
 			if self.currentWaist and self.originalWaistC0 then
-				-- CORRECTED: Calculate waist rotation relative to the root part's actual rotation
+				-- Calculate waist rotation relative to the root part's actual rotation
 				local clampedMousePitch = math.clamp(mousePitch, -math.rad(60), math.rad(60))
 
 				-- Get the root part's rotation CFrame (no position)
@@ -634,31 +624,6 @@ function ShoulderCamera:onRenderStep(dt)
 				local targetC0 = self.originalWaistC0 * CFrame.Angles(clampedMousePitch, relativeYaw, 0)
 				self.currentWaist.C0 = self.currentWaist.C0:Lerp(targetC0, 0.3)
 			end
-
-			--[[ DUPLICATE BLOCK REMOVED AS REQUESTED
-			if self.currentWaist and self.originalWaistC0 then
-				-- FIXED: Simple approach - calculate aim direction relative to root part
-				-- Get where root is facing
-				local rootLook = self.currentRootPart.CFrame.LookVector
-				local rootYaw = math.atan2(-rootLook.X, -rootLook.Z)
-
-				-- Calculate how much to rotate waist from neutral
-				local waistYaw = targetYaw - rootYaw
-
-				-- Normalize to -pi to pi
-				while waistYaw > math.pi do waistYaw = waistYaw - 2 * math.pi end
-				while waistYaw < -math.pi do waistYaw = waistYaw + 2 * math.pi end
-
-				-- Limit rotation
-				waistYaw = math.clamp(waistYaw, -math.rad(90), math.rad(90))
-				targetPitch = math.clamp(targetPitch, -math.rad(60), math.rad(60))
-
-				-- Apply rotation from original position
-				local targetC0 = self.originalWaistC0 * CFrame.Angles(targetPitch, waistYaw, 0)
-
-				self.currentWaist.C0 = self.currentWaist.C0:Lerp(targetC0, 0.3)
-			end
-			]]
 		else
 			-- When zoomed OR ON MOBILE, rotate entire character as before
 			self.currentHumanoid.AutoRotate = false
@@ -669,12 +634,11 @@ function ShoulderCamera:onRenderStep(dt)
 				self.currentWaist.C0 = self.currentWaist.C0:Lerp(self.originalWaistC0, 0.3)
 			end
 
-			-- MODIFICATION: EXPLICITLY CHECK FOR MOBILE OR ZOOMED
+			-- Apply root joint fix when mobile or zoomed
 			if self.isMobile or self.zoomState then
 				self:applyRootJointFix()
 			end
 		end
-		-- Rotating torso issue fixed above here
 	else
 		self.currentHumanoid.AutoRotate = true
 
@@ -706,29 +670,6 @@ function ShoulderCamera:applyRootJointFix()
 	end
 end
 
-function ShoulderCamera:sprintFromTouchInput()
-	local moveVector = nil
-	local activeController = nil
-	local activeControllerIsTouch = nil
-	if self.controlModule then
-		moveVector = self.controlModule:GetMoveVector()
-		activeController = self.controlModule:GetActiveController()
-	end
-	if moveVector and activeController then
-		activeControllerIsTouch = activeController.thumbstickFrame ~= nil or activeController.thumbpadFrame ~= nil
-	end
-
-	if activeControllerIsTouch then
-		return (moveVector and moveVector.Magnitude >= 0.9)
-	else
-		return false
-	end
-end
-
-function ShoulderCamera:sprintFromGamepadInput()
-	return self.movementPan.Magnitude > 0.9
-end
-
 function ShoulderCamera:onCurrentCharacterChanged(character)
 	self.currentCharacter = character
 	if self.currentCharacter then
@@ -739,7 +680,7 @@ function ShoulderCamera:onCurrentCharacterChanged(character)
 		self.rootRigAttach = self.currentRootPart:WaitForChild("RootRigAttachment")
 		self.rootJoint = character:WaitForChild("LowerTorso"):WaitForChild("Root")
 		self.currentWaist = character:WaitForChild("UpperTorso"):WaitForChild("Waist")
-		self.originalWaistC0 = self.currentWaist.C0  -- NEW: Store original waist position
+		self.originalWaistC0 = self.currentWaist.C0
 		self.currentWrist = character:WaitForChild("RightHand"):WaitForChild("RightWrist")
 		self.wristAttach0 = character:WaitForChild("RightLowerArm"):WaitForChild("RightWristRigAttachment")
 		self.wristAttach1 = character:WaitForChild("RightHand"):WaitForChild("RightWristRigAttachment")
@@ -791,7 +732,7 @@ function ShoulderCamera:onCurrentCharacterChanged(character)
 		self.currentHumanoid = nil
 		self.currentRootPart = nil
 		self.controlModule = nil
-		self.originalWaistC0 = nil  -- NEW: Clear stored waist position
+		self.originalWaistC0 = nil
 	end
 end
 
@@ -907,12 +848,13 @@ function ShoulderCamera:handlePartTransparencies()
 	end
 end
 
-function ShoulderCamera:setSprintEnabled(enabled)
-	self.sprintEnabled = enabled
-end
-
 function ShoulderCamera:setSlowZoomWalkEnabled(enabled)
 	self.slowZoomWalkEnabled = enabled
+end
+
+function ShoulderCamera:setSprintEnabled(enabled)
+	-- No-op: Sprint handled by ModernSprintScript now
+	-- This function exists only so WeaponsSystem doesn't error
 end
 
 function ShoulderCamera:setHasScope(hasScope)
@@ -923,11 +865,6 @@ function ShoulderCamera:setHasScope(hasScope)
 	self.hasScope = hasScope
 	self:updateZoomState()
 end
-
-function ShoulderCamera:onSprintAction(actionName, inputState, inputObj)
-	self.sprintingInputActivated = inputState == Enum.UserInputState.Begin
-end
-
 
 -- Zoom related functions
 
@@ -1140,8 +1077,7 @@ function ShoulderCamera:onInputBegan(inputObj, wasProcessed)
 end
 
 function ShoulderCamera:onInputChanged(inputObj, wasProcessed)
-	-- MODIFIED: Only apply mouse movement when zoomed (mouse locked)
-	-- This logic is for DESKTOP mouse only. Mobile is handled by the Touch input handler.
+	-- Only apply mouse movement when zoomed (mouse locked)
 	if inputObj.UserInputType == Enum.UserInputType.MouseMovement then
 		if self.zoomState then
 			local yawInput = -inputObj.Delta.X * self.currentMouseRadsPerPixel.X
