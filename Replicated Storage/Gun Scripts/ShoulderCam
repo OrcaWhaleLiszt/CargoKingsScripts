@@ -635,6 +635,7 @@ function ShoulderCamera:onRenderStep(dt)
 				self.currentWaist.C0 = self.currentWaist.C0:Lerp(targetC0, 0.3)
 			end
 
+			--[[ DUPLICATE BLOCK REMOVED AS REQUESTED
 			if self.currentWaist and self.originalWaistC0 then
 				-- FIXED: Simple approach - calculate aim direction relative to root part
 				-- Get where root is facing
@@ -657,6 +658,7 @@ function ShoulderCamera:onRenderStep(dt)
 
 				self.currentWaist.C0 = self.currentWaist.C0:Lerp(targetC0, 0.3)
 			end
+			]]
 		else
 			-- When zoomed OR ON MOBILE, rotate entire character as before
 			self.currentHumanoid.AutoRotate = false
@@ -667,7 +669,10 @@ function ShoulderCamera:onRenderStep(dt)
 				self.currentWaist.C0 = self.currentWaist.C0:Lerp(self.originalWaistC0, 0.3)
 			end
 
-			self:applyRootJointFix()
+			-- MODIFICATION: EXPLICITLY CHECK FOR MOBILE OR ZOOMED
+			if self.isMobile or self.zoomState then
+				self:applyRootJointFix()
+			end
 		end
 		-- Rotating torso issue fixed above here
 	else
@@ -1167,7 +1172,7 @@ function ShoulderCamera:onInputEnded(inputObj, wasProcessed)
 				self.currentTool:Deactivate()
 			elseif self.zoomState and self.hasScope and touchTime < self.touchDelayTime and not self.applyingTouchPan then
 				self.currentTool:Activate()
-				self.currentTool:Deactivate()
+				self.currentTool:Deactive()
 			end
 			self.firingTool = false
 
